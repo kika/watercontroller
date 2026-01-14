@@ -1,15 +1,14 @@
-[target.xtensa-esp32-none-elf]
-runner = "espflash flash --monitor --chip esp32"
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
 
 [env]
-ESP_LOG="info"
+MCU = "esp32"
+ESP_IDF_VERSION = "v5.3"
+ESP_LOG = "info"
 
 [build]
-rustflags = [
-  "-C", "link-arg=-nostartfiles",
-]
-
-target = "xtensa-esp32-none-elf"
+target = "xtensa-esp32-espidf"
 
 [unstable]
-build-std = ["alloc", "core"]
+build-std = ["std", "panic_abort"]

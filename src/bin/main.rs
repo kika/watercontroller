@@ -1,52 +1,87 @@
-#![no_std]
-#![no_main]
-#![deny(
-  clippy::mem_forget,
-  reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
-    holding buffers for the duration of a data transfer."
-)]
-#![deny(clippy::large_stack_frames)]
+use std::thread;
+use std::time::Duration;
 
-use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
-use esp_backtrace as _;
-use esp_hal::clock::CpuClock;
-use esp_hal::timer::timg::TimerGroup;
+use esp_idf_svc::eth::{BlockingEth, EspEth, EthDriver, RmiiClockConfig, RmiiEthChipset};
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::gpio::{Gpio0, Gpio16, Gpio17};
+use esp_idf_svc::hal::prelude::Peripherals;
+use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
 use log::info;
 
-extern crate alloc;
+fn main() -> anyhow::Result<()> {
+    // It is necessary to call this function once. Otherwise some patches to the runtime
+    // implemented by esp-idf-sys might not link properly.
+    esp_idf_svc::sys::link_patches();
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
-esp_bootloader_esp_idf::esp_app_desc!();
+    // Bind the log crate to the ESP Logging facilities
+    EspLogger::initialize_default();
 
-#[allow(
-  clippy::large_stack_frames,
-  reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
-#[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
-  // generator version: 1.2.0
+    info!("Water controller v{}", env!("CARGO_PKG_VERSION"));
+    info!("Written by Kirill Pertsev kika@kikap.com in 2026");
 
-  esp_println::logger::init_logger_from_env();
+    let peripherals = Peripherals::take()?;
+    let sysloop = EspSystemEventLoop::take()?;
 
-  let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-  let peripherals = esp_hal::init(config);
+    // Initialize Ethernet with RTL8201 PHY for wESP32 rev7+
+    // Pin mapping:
+    //   MDC: GPIO16
+    //   MDIO: GPIO17
+    //   Clock: GPIO0 (input from PHY)
+    //   PHY Address: 0
+    info!("Initializing Ethernet (RTL8201 PHY)...");
 
-  esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
+    let eth_driver = EthDriver::new_rmii(
+        peripherals.mac,
+        peripherals.pins.gpio25, // RXD0
+        peripherals.pins.gpio26, // RXD1
+        peripherals.pins.gpio27, // CRS_DV
+        peripherals.pins.gpio16, // MDC
+        peripherals.pins.gpio22, // TXD1
+        peripherals.pins.gpio21, // TX_EN
+        peripherals.pins.gpio19, // TXD0
+        peripherals.pins.gpio17, // MDIO
+        RmiiClockConfig::<Gpio0, Gpio16, Gpio17>::Input(peripherals.pins.gpio0),
+        None::<esp_idf_svc::hal::gpio::Gpio5>, // No reset pin
+        RmiiEthChipset::RTL8201,
+        Some(0), // PHY address
+        sysloop.clone(),
+    )?;
 
-  let timg0 = TimerGroup::new(peripherals.TIMG0);
-  esp_rtos::start(timg0.timer0);
+    let eth = EspEth::wrap_all(
+        eth_driver,
+        EspNetif::new_with_conf(&NetifConfiguration::eth_default_client())?,
+    )?;
 
-  info!("Embassy initialized!");
+    info!("Ethernet driver initialized, starting...");
 
-  // TODO: Spawn some tasks
-  let _ = spawner;
+    let mut eth = BlockingEth::wrap(eth, sysloop.clone())?;
+    eth.start()?;
 
-  loop {
-    info!("Hello world!");
-    Timer::after(Duration::from_secs(1)).await;
-  }
+    info!("Waiting for Ethernet link...");
+    eth.wait_netif_up()?;
 
-  // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples
+    // DHCP request loop - wait for IP address
+    info!("Ethernet link up, waiting for DHCP lease...");
+    loop {
+        let ip_info = eth.eth().netif().get_ip_info()?;
+
+        if !ip_info.ip.is_unspecified() {
+            info!("DHCP lease acquired!");
+            info!("  IP address: {}", ip_info.ip);
+            info!("  Subnet mask: {}", ip_info.subnet.mask);
+            info!("  Gateway: {:?}", ip_info.subnet.gateway);
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    info!("Network ready, entering main loop...");
+
+    // Main application loop
+    loop {
+        info!("Hello world!");
+        thread::sleep(Duration::from_secs(1));
+    }
 }
