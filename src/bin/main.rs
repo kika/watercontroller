@@ -10,11 +10,7 @@ use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
 use log::info;
 
 fn main() -> anyhow::Result<()> {
-    // It is necessary to call this function once. Otherwise some patches to the runtime
-    // implemented by esp-idf-sys might not link properly.
     esp_idf_svc::sys::link_patches();
-
-    // Bind the log crate to the ESP Logging facilities
     EspLogger::initialize_default();
 
     info!("Water controller v{}", env!("CARGO_PKG_VERSION"));
@@ -29,6 +25,7 @@ fn main() -> anyhow::Result<()> {
     //   MDIO: GPIO17
     //   Clock: GPIO0 (input from PHY)
     //   PHY Address: 0
+    //   https://wesp32.com/files/wESP32-Product-Brief.pdf
     info!("Initializing Ethernet (RTL8201 PHY)...");
 
     let eth_driver = EthDriver::new_rmii(
