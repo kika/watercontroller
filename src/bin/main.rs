@@ -7,7 +7,7 @@ use esp_idf_svc::hal::gpio::{Gpio0, Gpio16, Gpio17};
 use esp_idf_svc::hal::prelude::Peripherals;
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
-use log::info;
+use log::{info, warn};
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -55,30 +55,53 @@ fn main() -> anyhow::Result<()> {
     let mut eth = BlockingEth::wrap(eth, sysloop.clone())?;
     eth.start()?;
 
+    // Initial connection
     info!("Waiting for Ethernet link...");
     eth.wait_netif_up()?;
+    info!("Ethernet link up");
 
-    // DHCP request loop - wait for IP address
-    info!("Ethernet link up, waiting for DHCP lease...");
+    wait_for_dhcp(eth.eth().netif())?;
+
+    info!("Network ready, entering main loop...");
+
+    // Main application loop with connection monitoring
     loop {
+        let is_up = eth.is_up()?;
         let ip_info = eth.eth().netif().get_ip_info()?;
+        let has_ip = !ip_info.ip.is_unspecified();
+
+        if !is_up {
+            warn!("Ethernet link lost!");
+            // Wait for link to come back
+            info!("Waiting for Ethernet link...");
+            eth.wait_netif_up()?;
+            info!("Ethernet link restored");
+            wait_for_dhcp(eth.eth().netif())?;
+            info!("Network restored, resuming main loop...");
+        } else if !has_ip {
+            warn!("Lost IP address, waiting for DHCP lease...");
+            wait_for_dhcp(eth.eth().netif())?;
+            info!("IP address restored, resuming main loop...");
+        }
+
+        info!("Hello world!");
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn wait_for_dhcp(netif: &EspNetif) -> anyhow::Result<()> {
+    info!("Waiting for DHCP lease...");
+    loop {
+        let ip_info = netif.get_ip_info()?;
 
         if !ip_info.ip.is_unspecified() {
             info!("DHCP lease acquired!");
             info!("  IP address: {}", ip_info.ip);
             info!("  Subnet mask: {}", ip_info.subnet.mask);
             info!("  Gateway: {:?}", ip_info.subnet.gateway);
-            break;
+            return Ok(());
         }
 
         thread::sleep(Duration::from_millis(500));
-    }
-
-    info!("Network ready, entering main loop...");
-
-    // Main application loop
-    loop {
-        info!("Hello world!");
-        thread::sleep(Duration::from_secs(1));
     }
 }
