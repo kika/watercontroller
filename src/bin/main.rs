@@ -1,13 +1,24 @@
+use std::net::Ipv4Addr;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use esp_idf_svc::eth::{BlockingEth, EspEth, EthDriver, RmiiClockConfig, RmiiEthChipset};
+use esp_idf_svc::eth::{EspEth, EthDriver, EthEvent, RmiiClockConfig, RmiiEthChipset};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{Gpio0, Gpio16, Gpio17};
 use esp_idf_svc::hal::prelude::Peripherals;
 use esp_idf_svc::log::EspLogger;
-use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
+use esp_idf_svc::netif::{EspNetif, IpEvent, NetifConfiguration};
 use log::{info, warn};
+
+/// Network events communicated from event callbacks to main loop
+#[derive(Debug)]
+enum NetEvent {
+    LinkUp,
+    LinkDown,
+    GotIp { ip: Ipv4Addr, gateway: Ipv4Addr },
+    LostIp,
+}
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -45,43 +56,97 @@ fn main() -> anyhow::Result<()> {
         sysloop.clone(),
     )?;
 
-    let eth = EspEth::wrap_all(
+    let mut eth = EspEth::wrap_all(
         eth_driver,
         EspNetif::new_with_conf(&NetifConfiguration::eth_default_client())?,
     )?;
 
-    info!("Ethernet driver initialized, starting...");
+    info!("Ethernet driver initialized");
 
-    let mut eth = BlockingEth::wrap(eth, sysloop.clone())?;
+    // Set up event channel
+    let (tx, rx) = mpsc::channel::<NetEvent>();
+
+    // Subscribe to Ethernet events (link up/down)
+    let tx_eth = tx.clone();
+    let _eth_subscription = sysloop.subscribe::<EthEvent, _>(move |event| {
+        let net_event = match event {
+            EthEvent::Connected(_) => {
+                info!("Event: Ethernet link connected");
+                NetEvent::LinkUp
+            }
+            EthEvent::Disconnected(_) => {
+                warn!("Event: Ethernet link disconnected");
+                NetEvent::LinkDown
+            }
+            EthEvent::Started(_) => {
+                info!("Event: Ethernet started");
+                return;
+            }
+            EthEvent::Stopped(_) => {
+                info!("Event: Ethernet stopped");
+                return;
+            }
+        };
+        let _ = tx_eth.send(net_event);
+    })?;
+
+    // Subscribe to IP events (DHCP)
+    let tx_ip = tx.clone();
+    let _ip_subscription = sysloop.subscribe::<IpEvent, _>(move |event| {
+        match event {
+            IpEvent::DhcpIpAssigned(assignment) => {
+                let ip_info = assignment.ip_info();
+                info!("Event: DHCP IP assigned - {}", ip_info.ip);
+                let _ = tx_ip.send(NetEvent::GotIp {
+                    ip: ip_info.ip,
+                    gateway: ip_info.subnet.gateway,
+                });
+            }
+            IpEvent::DhcpIpDeassigned(_) => {
+                warn!("Event: DHCP IP deassigned");
+                let _ = tx_ip.send(NetEvent::LostIp);
+            }
+            _ => {}
+        }
+    })?;
+
+    // Start ethernet (this will trigger events)
+    info!("Starting Ethernet...");
     eth.start()?;
 
-    // Initial connection
-    info!("Waiting for Ethernet link...");
-    eth.wait_netif_up()?;
-    info!("Ethernet link up");
+    // Wait for initial network connection
+    info!("Waiting for network...");
+    let (ip, gateway) = wait_for_network(&rx)?;
+    info!("Network ready!");
+    info!("  IP address: {}", ip);
+    info!("  Gateway: {}", gateway);
 
-    wait_for_dhcp(eth.eth().netif())?;
+    info!("Entering main loop...");
 
-    info!("Network ready, entering main loop...");
-
-    // Main application loop with connection monitoring
+    // Main application loop
     loop {
-        let is_up = eth.is_up()?;
-        let ip_info = eth.eth().netif().get_ip_info()?;
-        let has_ip = !ip_info.ip.is_unspecified();
-
-        if !is_up {
-            warn!("Ethernet link lost!");
-            // Wait for link to come back
-            info!("Waiting for Ethernet link...");
-            eth.wait_netif_up()?;
-            info!("Ethernet link restored");
-            wait_for_dhcp(eth.eth().netif())?;
-            info!("Network restored, resuming main loop...");
-        } else if !has_ip {
-            warn!("Lost IP address, waiting for DHCP lease...");
-            wait_for_dhcp(eth.eth().netif())?;
-            info!("IP address restored, resuming main loop...");
+        // Check for network events (non-blocking)
+        match rx.try_recv() {
+            Ok(NetEvent::LinkDown) | Ok(NetEvent::LostIp) => {
+                warn!("Network lost, waiting for reconnection...");
+                let (ip, gateway) = wait_for_network(&rx)?;
+                info!("Network restored!");
+                info!("  IP address: {}", ip);
+                info!("  Gateway: {}", gateway);
+            }
+            Ok(NetEvent::GotIp { ip, gateway }) => {
+                // IP changed (e.g., DHCP renewal with different IP)
+                info!("IP address changed: {} (gateway: {})", ip, gateway);
+            }
+            Ok(NetEvent::LinkUp) => {
+                info!("Ethernet link restored");
+            }
+            Err(TryRecvError::Empty) => {
+                // No events, continue main loop
+            }
+            Err(TryRecvError::Disconnected) => {
+                anyhow::bail!("Event channel disconnected");
+            }
         }
 
         info!("Hello world!");
@@ -89,19 +154,30 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn wait_for_dhcp(netif: &EspNetif) -> anyhow::Result<()> {
-    info!("Waiting for DHCP lease...");
+/// Blocks until we have both link up and an IP address
+fn wait_for_network(rx: &Receiver<NetEvent>) -> anyhow::Result<(Ipv4Addr, Ipv4Addr)> {
+    let mut link_up = false;
+
     loop {
-        let ip_info = netif.get_ip_info()?;
-
-        if !ip_info.ip.is_unspecified() {
-            info!("DHCP lease acquired!");
-            info!("  IP address: {}", ip_info.ip);
-            info!("  Subnet mask: {}", ip_info.subnet.mask);
-            info!("  Gateway: {:?}", ip_info.subnet.gateway);
-            return Ok(());
+        match rx.recv()? {
+            NetEvent::LinkUp => {
+                info!("Link up, waiting for DHCP...");
+                link_up = true;
+            }
+            NetEvent::LinkDown => {
+                warn!("Link down");
+                link_up = false;
+            }
+            NetEvent::GotIp { ip, gateway } if link_up => {
+                return Ok((ip, gateway));
+            }
+            NetEvent::GotIp { .. } => {
+                // Got IP but link not up yet (shouldn't happen, but handle it)
+                error!("Got IP but waiting for link...");
+            }
+            NetEvent::LostIp => {
+                info!("Lost IP, continuing to wait...");
+            }
         }
-
-        thread::sleep(Duration::from_millis(500));
     }
 }
