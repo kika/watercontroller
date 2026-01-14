@@ -8,8 +8,9 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{Gpio0, Gpio16, Gpio17};
 use esp_idf_svc::hal::prelude::Peripherals;
 use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::ipv4::{self, ClientConfiguration, DHCPClientSettings};
 use esp_idf_svc::netif::{EspNetif, IpEvent, NetifConfiguration};
-use log::{info, warn};
+use log::{error, info, warn};
 
 /// Network events communicated from event callbacks to main loop
 #[derive(Debug)]
@@ -56,10 +57,16 @@ fn main() -> anyhow::Result<()> {
         sysloop.clone(),
     )?;
 
-    let mut eth = EspEth::wrap_all(
-        eth_driver,
-        EspNetif::new_with_conf(&NetifConfiguration::eth_default_client())?,
-    )?;
+    let netif_config = NetifConfiguration {
+        ip_configuration: Some(ipv4::Configuration::Client(ClientConfiguration::DHCP(
+            DHCPClientSettings {
+                hostname: Some("watercontroller".try_into().unwrap()),
+            },
+        ))),
+        ..NetifConfiguration::eth_default_client()
+    };
+
+    let mut eth = EspEth::wrap_all(eth_driver, EspNetif::new_with_conf(&netif_config)?)?;
 
     info!("Ethernet driver initialized");
 
