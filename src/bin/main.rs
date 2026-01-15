@@ -5,12 +5,14 @@ use std::time::Duration;
 
 use esp_idf_svc::eth::{EspEth, EthDriver, EthEvent, RmiiClockConfig, RmiiEthChipset};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::gpio::{Gpio0, Gpio16, Gpio17};
-use esp_idf_svc::hal::prelude::Peripherals;
-use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::hal::gpio::{AnyIOPin, Gpio0, Gpio16, Gpio17};
+use esp_idf_svc::hal::prelude::*;
+use esp_idf_svc::hal::uart::{self, UartDriver};
 use esp_idf_svc::ipv4::{self, ClientConfiguration, DHCPClientSettings};
+use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::netif::{EspNetif, IpEvent, NetifConfiguration};
-use log::{error, info, warn};
+use log::*;
+use watercontroller::sen0676::{Sen0676, DEFAULT_ADDRESS};
 
 /// Network events communicated from event callbacks to main loop
 #[derive(Debug)]
@@ -24,9 +26,14 @@ enum NetEvent {
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     EspLogger::initialize_default();
+    let app_name = env!("CARGO_PKG_NAME");
+    esp_idf_svc::log::set_target_level(&app_name, log::LevelFilter::Debug).unwrap();
+    log::set_max_level(log::LevelFilter::Debug);
 
+    info!("----------------------------------------");
     info!("Water controller v{}", env!("CARGO_PKG_VERSION"));
     info!("Written by Kirill Pertsev kika@kikap.com in 2026");
+    debug!("Debug output enabled");
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
@@ -69,6 +76,24 @@ fn main() -> anyhow::Result<()> {
     let mut eth = EspEth::wrap_all(eth_driver, EspNetif::new_with_conf(&netif_config)?)?;
 
     info!("Ethernet driver initialized");
+
+    // Initialize UART1 for SEN0676 radar sensor
+    // TX: GPIO12, RX: GPIO13, 115200 baud, 8N1
+    info!("Initializing UART1 for radar sensor...");
+    let uart_config = uart::config::Config::default().baudrate(Hertz(115200));
+    let uart = UartDriver::new(
+        peripherals.uart1,
+        peripherals.pins.gpio12, // TX
+        peripherals.pins.gpio13, // RX
+        Option::<AnyIOPin>::None,
+        Option::<AnyIOPin>::None,
+        &uart_config,
+    )?;
+
+    let mut radar = Sen0676::new(uart, DEFAULT_ADDRESS);
+    info!("Radar sensor initialized, draining boot messages...");
+    radar.drain_ascii_messages();
+    info!("Radar ready");
 
     // Set up event channel
     let (tx, rx) = mpsc::channel::<NetEvent>();
@@ -156,7 +181,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        info!("Hello world!");
+        // Read radar sensor
+        match radar.read_empty_height() {
+            Ok(height) => info!("Empty height: {} mm", height),
+            Err(e) => warn!("Radar read error: {:?}", e),
+        }
+
         thread::sleep(Duration::from_secs(1));
     }
 }

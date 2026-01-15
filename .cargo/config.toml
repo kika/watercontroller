@@ -5,7 +5,7 @@ runner = "espflash flash --monitor"
 [env]
 MCU = "esp32"
 ESP_IDF_VERSION = "v5.3"
-ESP_LOG = "info"
+ESP_LOG = "debug"
 
 [build]
 target = "xtensa-esp32-espidf"

@@ -5,13 +5,16 @@ resolver = "2"
 rust-version = "1.77"
 version = "0.1.0"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "watercontroller"
 path = "./src/bin/main.rs"
 
 [dependencies]
 esp-idf-svc = { version = "0.51", features = ["alloc"] }
-log = "0.4"
+log = { version = "0.4", features = ["max_level_debug", "release_max_level_debug"] }
 anyhow = "1"
 
 [build-dependencies]
@@ -24,7 +27,7 @@ opt-level = "s"
 
 [profile.release]
 codegen-units = 1     # LLVM can perform better optimizations using a single thread
-debug = 2
+debug = true
 debug-assertions = false
 incremental = false
 lto = 'fat'
