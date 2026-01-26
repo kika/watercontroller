@@ -7,12 +7,7 @@ use std::net::Ipv4Addr;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 #[cfg(feature = "display")]
-use embedded_graphics::{
-  mono_font::{MonoTextStyle, ascii::FONT_10X20},
-  pixelcolor::BinaryColor,
-  prelude::*,
-  text::Text,
-};
+use embedded_graphics::geometry::{Point, Size};
 #[cfg(feature = "display")]
 use esp_idf_svc::hal::spi::{
   SpiDeviceDriver, SpiDriver, SpiDriverConfig,
@@ -43,6 +38,8 @@ use log::*;
 
 #[cfg(feature = "display")]
 use watercontroller::ls027b7dh01::Ls027b7dh01;
+#[cfg(feature = "display")]
+use watercontroller::ui::{WaterTank, Manometer};
 #[cfg(feature = "radar")]
 use watercontroller::sen0676::{DEFAULT_ADDRESS, Sen0676};
 
@@ -98,7 +95,7 @@ fn main() -> anyhow::Result<()> {
 
     // Configure SPI Mode 1 (CPOL=0, CPHA=1) and LSB-first
     let spi_config = SpiConfig::default()
-      .baudrate(1.MHz().into())
+      .baudrate(2.MHz().into())
       .data_mode(esp_idf_svc::hal::spi::config::MODE_1)
       .write_only(true)
       .bit_order(BitOrder::LsbFirst);
@@ -110,30 +107,17 @@ fn main() -> anyhow::Result<()> {
 
     let mut display = Ls027b7dh01::new(spi_device, cs_pin);
     display.init()?;
-    info!("Display cleared");
-
-    // Test: fill with solid black
-    info!("Filling display with black...");
-    display.fill_black()?;
-    info!("Display should be all black now");
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
-    // Now clear to white
-    info!("Clearing to white...");
-    display.clear_display()?;
-    info!("Display should be all white now");
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
-    // Draw initial text
-    info!("Drawing text...");
-    let style = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
-    Text::new("Water Controller", Point::new(10, 30), style).draw(&mut display)?;
-    Text::new("Initializing...", Point::new(10, 60), style).draw(&mut display)?;
-    display.flush()?;
     info!("Display initialized");
 
     display
   };
+
+  // Create UI components
+  #[cfg(feature = "display")]
+  let mut tank = WaterTank::new(Point::new(20, 20), Size::new(120, 200));
+
+  #[cfg(feature = "display")]
+  let mut manometer = Manometer::new(Point::new(280, 120), 100);
 
   // ============================================================
   // Ethernet initialization (feature: ethernet)
@@ -266,6 +250,14 @@ fn main() -> anyhow::Result<()> {
   // ============================================================
   info!("Entering main loop...");
 
+  // Demo values (will be replaced with real sensor data)
+  #[cfg(feature = "display")]
+  let mut demo_percent: u8 = 0;
+  #[cfg(feature = "display")]
+  let mut demo_psi: u16 = 0;
+  #[cfg(feature = "display")]
+  let mut demo_rising = true;
+
   loop {
     // Check for network events (non-blocking)
     #[cfg(feature = "ethernet")]
@@ -296,11 +288,39 @@ fn main() -> anyhow::Result<()> {
       Err(e) => warn!("Radar read error: {:?}", e),
     }
 
-    // Toggle VCOM (required for Sharp Memory LCD - at least once per second)
+    // Update display
     #[cfg(feature = "display")]
-    display.toggle_vcom()?;
+    {
+      // Demo animation: cycle values up and down
+      if demo_rising {
+        demo_percent = demo_percent.saturating_add(5);
+        demo_psi = demo_psi.saturating_add(8);
+        if demo_percent >= 100 {
+          demo_rising = false;
+        }
+      } else {
+        demo_percent = demo_percent.saturating_sub(5);
+        demo_psi = demo_psi.saturating_sub(8);
+        if demo_percent == 0 {
+          demo_rising = true;
+        }
+      }
 
-    thread::sleep(Duration::from_secs(1));
+      // Calculate gallons (assuming 500 gallon tank capacity)
+      let gallons = (500u32 * demo_percent as u32 / 100) as u16;
+
+      // Update UI component values
+      tank.set_level(demo_percent, gallons);
+      manometer.set_pressure(demo_psi.min(150));
+
+      // Clear and redraw
+      display.clear_display()?;
+      tank.draw(&mut display)?;
+      manometer.draw(&mut display)?;
+      display.flush()?;
+    }
+
+    thread::sleep(Duration::from_millis(200));
   }
 }
 
