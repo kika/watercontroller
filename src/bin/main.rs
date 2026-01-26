@@ -313,8 +313,7 @@ fn main() -> anyhow::Result<()> {
       tank.set_level(demo_percent, gallons);
       manometer.set_pressure(demo_psi.min(150));
 
-      // Clear and redraw
-      display.clear_display()?;
+      // Draw UI (components clear their own areas)
       tank.draw(&mut display)?;
       manometer.draw(&mut display)?;
       display.flush()?;

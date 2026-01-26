@@ -53,6 +53,17 @@ impl WaterTank {
         let fill_height = (h * self.fill_percent as i32) / 100;
         let fill_top = y + h - fill_height;
 
+        // Clear entire tank area with white (empty portion)
+        let empty_height = h - fill_height;
+        if empty_height > 0 {
+            Rectangle::new(
+                self.position,
+                Size::new(self.size.width, empty_height as u32),
+            )
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display)?;
+        }
+
         // Draw filled water portion (black = water)
         if fill_height > 0 {
             Rectangle::new(
@@ -143,6 +154,14 @@ impl Manometer {
     where
         D: DrawTarget<Color = BinaryColor>,
     {
+        // Clear bounding box with white
+        Rectangle::new(
+            Point::new(self.center.x - self.radius, self.center.y - self.radius),
+            Size::new((self.radius * 2) as u32, (self.radius * 2) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)?;
+
         // Draw outer circle
         Circle::new(
             Point::new(self.center.x - self.radius, self.center.y - self.radius),

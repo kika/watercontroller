@@ -33,6 +33,8 @@ pub const HEIGHT: u16 = 240;
 const BYTES_PER_LINE: usize = 50;
 /// Total framebuffer size
 const FRAMEBUFFER_SIZE: usize = BYTES_PER_LINE * HEIGHT as usize;
+/// Dirty line bitmap size (240 lines / 8 bits per byte = 30 bytes)
+const DIRTY_BITMAP_SIZE: usize = (HEIGHT as usize + 7) / 8;
 
 /// Mode bits (LSB-first format)
 mod cmd {
@@ -53,6 +55,7 @@ where
   spi: SpiDeviceDriver<'d, SPI>,
   cs: PinDriver<'d, CS, Output>,
   framebuffer: [u8; FRAMEBUFFER_SIZE],
+  dirty_lines: [u8; DIRTY_BITMAP_SIZE],
   vcom: bool,
 }
 
@@ -67,6 +70,7 @@ where
       spi,
       cs,
       framebuffer: [0xFF; FRAMEBUFFER_SIZE], // White (all 1s)
+      dirty_lines: [0; DIRTY_BITMAP_SIZE],   // No dirty lines initially
       vcom: false,
     }
   }
@@ -82,6 +86,7 @@ where
   /// Clear the entire display to white
   pub fn clear_display(&mut self) -> Result<(), esp_idf_svc::sys::EspError> {
     self.framebuffer.fill(0xFF);
+    self.dirty_lines.fill(0); // Hardware clear, so no dirty lines
 
     self.cs.set_high()?;
     let mode = cmd::CLEAR | if self.vcom { cmd::VCOM } else { 0 };
@@ -92,9 +97,38 @@ where
     Ok(())
   }
 
+  /// Mark a line as dirty
+  #[inline]
+  fn mark_dirty(&mut self, line: u16) {
+    let byte_idx = line as usize / 8;
+    let bit_idx = line % 8;
+    self.dirty_lines[byte_idx] |= 1 << bit_idx;
+  }
+
+  /// Check if a line is dirty
+  #[inline]
+  fn is_dirty(&self, line: u16) -> bool {
+    let byte_idx = line as usize / 8;
+    let bit_idx = line % 8;
+    (self.dirty_lines[byte_idx] & (1 << bit_idx)) != 0
+  }
+
+  /// Mark all lines as dirty (for full refresh)
+  pub fn mark_all_dirty(&mut self) {
+    self.dirty_lines.fill(0xFF);
+  }
+
+  /// Clear framebuffer to white without sending to display
+  /// Call flush() after drawing to send only changed lines
+  pub fn clear_framebuffer(&mut self) {
+    self.framebuffer.fill(0xFF);
+    self.mark_all_dirty();
+  }
+
   /// Fill display with black
   pub fn fill_black(&mut self) -> Result<(), esp_idf_svc::sys::EspError> {
     self.framebuffer.fill(0x00);
+    self.mark_all_dirty();
     self.flush()
   }
 
@@ -109,16 +143,27 @@ where
     Ok(())
   }
 
-  /// Write the framebuffer to the display
+  /// Write only dirty lines to the display
   pub fn flush(&mut self) -> Result<(), esp_idf_svc::sys::EspError> {
+    // Check if any lines are dirty
+    let has_dirty = self.dirty_lines.iter().any(|&b| b != 0);
+    if !has_dirty {
+      // Nothing to update, just toggle VCOM
+      return self.toggle_vcom();
+    }
+
     self.cs.set_high()?;
 
     // Send mode byte
     let mode = cmd::WRITE | if self.vcom { cmd::VCOM } else { 0 };
     self.spi.write(&[mode])?;
 
-    // Send each line: address + data + dummy
+    // Send only dirty lines
     for line in 0..HEIGHT {
+      if !self.is_dirty(line) {
+        continue;
+      }
+
       let mut line_buf = [0u8; 1 + BYTES_PER_LINE + 1];
       line_buf[0] = (line + 1) as u8; // Line address (1-indexed)
 
@@ -135,6 +180,9 @@ where
 
     self.cs.set_low()?;
     self.vcom = !self.vcom;
+
+    // Clear dirty flags
+    self.dirty_lines.fill(0);
     Ok(())
   }
 
@@ -147,12 +195,18 @@ where
     let byte_idx = y as usize * BYTES_PER_LINE + (x / 8) as usize;
     let bit_idx = x % 8; // LSB is leftmost pixel (Sharp Memory LCD format)
 
+    let old_byte = self.framebuffer[byte_idx];
     if color {
       // White = 1
       self.framebuffer[byte_idx] |= 1 << bit_idx;
     } else {
       // Black = 0
       self.framebuffer[byte_idx] &= !(1 << bit_idx);
+    }
+
+    // Mark line dirty only if pixel actually changed
+    if self.framebuffer[byte_idx] != old_byte {
+      self.mark_dirty(y);
     }
   }
 
