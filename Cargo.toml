@@ -12,10 +12,17 @@ path = "src/lib.rs"
 name = "watercontroller"
 path = "./src/bin/main.rs"
 
+[features]
+default = ["ethernet", "display"]
+ethernet = []
+display = ["dep:embedded-graphics"]
+radar = []
+
 [dependencies]
 esp-idf-svc = { version = "0.51", features = ["alloc"] }
 log = { version = "0.4", features = ["max_level_debug", "release_max_level_debug"] }
 anyhow = "1"
+embedded-graphics = { version = "0.8", optional = true }
 
 [build-dependencies]
 embuild = "0.33"
