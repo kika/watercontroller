@@ -6,3 +6,6 @@ pub mod ui;
 
 #[cfg(feature = "radar")]
 pub mod sen0676;
+
+#[cfg(feature = "pressure")]
+pub mod pressure;

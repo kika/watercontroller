@@ -17,6 +17,7 @@ default = ["ethernet", "display"]
 ethernet = []
 display = ["dep:embedded-graphics", "dep:libm"]
 radar = []
+pressure = []
 
 [dependencies]
 esp-idf-svc = { version = "0.51", features = ["alloc"] }

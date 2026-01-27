@@ -42,6 +42,8 @@ use watercontroller::ls027b7dh01::Ls027b7dh01;
 use watercontroller::ui::{WaterTank, Manometer};
 #[cfg(feature = "radar")]
 use watercontroller::sen0676::{DEFAULT_ADDRESS, Sen0676};
+#[cfg(feature = "pressure")]
+use watercontroller::pressure::PressureSensor;
 
 /// Network events communicated from event callbacks to main loop
 #[cfg(feature = "ethernet")]
@@ -72,6 +74,8 @@ fn main() -> anyhow::Result<()> {
   info!("Feature enabled: ethernet");
   #[cfg(feature = "radar")]
   info!("Feature enabled: radar");
+  #[cfg(feature = "pressure")]
+  info!("Feature enabled: pressure");
 
   let peripherals = Peripherals::take()?;
   let sysloop = EspSystemEventLoop::take()?;
@@ -246,6 +250,19 @@ fn main() -> anyhow::Result<()> {
   };
 
   // ============================================================
+  // Pressure sensor initialization (feature: pressure)
+  // ============================================================
+  #[cfg(feature = "pressure")]
+  let mut pressure_sensor = {
+    // GPIO36 (A0) with 10k/12k voltage divider
+    // Sensor: 0.5V = 0 PSI, 4.5V = 100 PSI
+    info!("Initializing pressure sensor on GPIO36...");
+    let sensor = PressureSensor::new(peripherals.adc1, peripherals.pins.gpio36)?;
+    info!("Pressure sensor ready");
+    sensor
+  };
+
+  // ============================================================
   // Main loop
   // ============================================================
   info!("Entering main loop...");
@@ -253,7 +270,7 @@ fn main() -> anyhow::Result<()> {
   // Demo values (will be replaced with real sensor data)
   #[cfg(feature = "display")]
   let mut demo_percent: u8 = 0;
-  #[cfg(feature = "display")]
+  #[cfg(all(feature = "display", not(feature = "pressure")))]
   let mut demo_psi: u16 = 0;
   #[cfg(feature = "display")]
   let mut demo_rising = true;
@@ -288,19 +305,30 @@ fn main() -> anyhow::Result<()> {
       Err(e) => warn!("Radar read error: {:?}", e),
     }
 
+    // Read pressure sensor
+    #[cfg(feature = "pressure")]
+    let current_psi = match pressure_sensor.read_psi_u16() {
+      Ok(psi) => {
+        debug!("Pressure: {} PSI", psi);
+        psi
+      }
+      Err(e) => {
+        warn!("Pressure read error: {:?}", e);
+        0
+      }
+    };
+
     // Update display
     #[cfg(feature = "display")]
     {
-      // Demo animation: cycle values up and down
+      // Demo animation for tank (will be replaced with radar data)
       if demo_rising {
         demo_percent = demo_percent.saturating_add(5);
-        demo_psi = demo_psi.saturating_add(8);
         if demo_percent >= 100 {
           demo_rising = false;
         }
       } else {
         demo_percent = demo_percent.saturating_sub(5);
-        demo_psi = demo_psi.saturating_sub(8);
         if demo_percent == 0 {
           demo_rising = true;
         }
@@ -309,9 +337,22 @@ fn main() -> anyhow::Result<()> {
       // Calculate gallons (assuming 500 gallon tank capacity)
       let gallons = (500u32 * demo_percent as u32 / 100) as u16;
 
+      // Get pressure value (real sensor or demo)
+      #[cfg(feature = "pressure")]
+      let psi = current_psi;
+      #[cfg(not(feature = "pressure"))]
+      let psi = {
+        if demo_rising {
+          demo_psi = demo_psi.saturating_add(8);
+        } else {
+          demo_psi = demo_psi.saturating_sub(8);
+        }
+        demo_psi.min(150)
+      };
+
       // Update UI component values
       tank.set_level(demo_percent, gallons);
-      manometer.set_pressure(demo_psi.min(150));
+      manometer.set_pressure(psi.min(150));
 
       // Draw UI (components clear their own areas)
       tank.draw(&mut display)?;
