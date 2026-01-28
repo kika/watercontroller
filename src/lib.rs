@@ -9,3 +9,6 @@ pub mod sen0676;
 
 #[cfg(feature = "pressure")]
 pub mod pressure;
+
+#[cfg(feature = "mqtt")]
+pub mod homeassistant;

@@ -44,6 +44,8 @@ use watercontroller::ui::{WaterTank, Manometer};
 use watercontroller::sen0676::{DEFAULT_ADDRESS, Sen0676};
 #[cfg(feature = "pressure")]
 use watercontroller::pressure::PressureSensor;
+#[cfg(feature = "mqtt")]
+use watercontroller::homeassistant::{HomeAssistant, WaterState};
 
 /// Network events communicated from event callbacks to main loop
 #[cfg(feature = "ethernet")]
@@ -76,6 +78,8 @@ fn main() -> anyhow::Result<()> {
   info!("Feature enabled: radar");
   #[cfg(feature = "pressure")]
   info!("Feature enabled: pressure");
+  #[cfg(feature = "mqtt")]
+  info!("Feature enabled: mqtt");
 
   let peripherals = Peripherals::take()?;
   let sysloop = EspSystemEventLoop::take()?;
@@ -263,17 +267,37 @@ fn main() -> anyhow::Result<()> {
   };
 
   // ============================================================
+  // MQTT / Home Assistant initialization (feature: mqtt)
+  // ============================================================
+  #[cfg(feature = "mqtt")]
+  let mut ha_client = {
+    info!("Initializing MQTT client for Home Assistant...");
+    let mut client = HomeAssistant::new()?;
+    // Give MQTT time to connect before sending discovery
+    thread::sleep(Duration::from_secs(2));
+    client.send_discovery()?;
+    info!("Home Assistant MQTT ready");
+    client
+  };
+
+  // ============================================================
   // Main loop
   // ============================================================
   info!("Entering main loop...");
 
   // Demo values (will be replaced with real sensor data)
-  #[cfg(feature = "display")]
+  #[cfg(any(feature = "display", feature = "mqtt"))]
   let mut demo_percent: u8 = 0;
   #[cfg(all(feature = "display", not(feature = "pressure")))]
   let mut demo_psi: u16 = 0;
-  #[cfg(feature = "display")]
+  #[cfg(any(feature = "display", feature = "mqtt"))]
   let mut demo_rising = true;
+
+  // MQTT publish interval
+  #[cfg(feature = "mqtt")]
+  const MQTT_INTERVAL: Duration = Duration::from_secs(5);
+  #[cfg(feature = "mqtt")]
+  let mut last_mqtt_publish = std::time::Instant::now();
 
   loop {
     // Check for network events (non-blocking)
@@ -317,11 +341,12 @@ fn main() -> anyhow::Result<()> {
         0
       }
     };
+    #[cfg(not(feature = "pressure"))]
+    let current_psi: u16 = 0;
 
-    // Update display
-    #[cfg(feature = "display")]
+    // Demo animation for tank (will be replaced with radar data)
+    #[cfg(any(feature = "display", feature = "mqtt"))]
     {
-      // Demo animation for tank (will be replaced with radar data)
       if demo_rising {
         demo_percent = demo_percent.saturating_add(5);
         if demo_percent >= 100 {
@@ -333,10 +358,29 @@ fn main() -> anyhow::Result<()> {
           demo_rising = true;
         }
       }
+    }
 
-      // Calculate gallons (assuming 500 gallon tank capacity)
-      let gallons = (500u32 * demo_percent as u32 / 100) as u16;
+    // Calculate gallons (assuming 500 gallon tank capacity)
+    #[cfg(any(feature = "display", feature = "mqtt"))]
+    let gallons = (500u32 * demo_percent as u32 / 100) as u16;
 
+    // Publish to Home Assistant via MQTT
+    #[cfg(feature = "mqtt")]
+    if last_mqtt_publish.elapsed() >= MQTT_INTERVAL {
+      last_mqtt_publish = std::time::Instant::now();
+      let state = WaterState {
+        capacity_percent: demo_percent,
+        capacity_gallons: gallons,
+        pressure_psi: current_psi,
+      };
+      if let Err(e) = ha_client.publish_state(&state) {
+        warn!("MQTT publish error: {:?}", e);
+      }
+    }
+
+    // Update display
+    #[cfg(feature = "display")]
+    {
       // Get pressure value (real sensor or demo)
       #[cfg(feature = "pressure")]
       let psi = current_psi;

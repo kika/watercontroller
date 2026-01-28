@@ -18,6 +18,7 @@ ethernet = []
 display = ["dep:embedded-graphics", "dep:libm"]
 radar = []
 pressure = []
+mqtt = ["ethernet"]
 
 [dependencies]
 esp-idf-svc = { version = "0.51", features = ["alloc"] }
