@@ -9,6 +9,13 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 #[cfg(feature = "display")]
 use embedded_graphics::geometry::{Point, Size};
 #[cfg(feature = "display")]
+use embedded_graphics::{
+  Drawable,
+  mono_font::{MonoTextStyleBuilder, ascii::FONT_10X20},
+  pixelcolor::BinaryColor,
+  text::Text,
+};
+#[cfg(feature = "display")]
 use esp_idf_svc::hal::spi::{
   SpiDeviceDriver, SpiDriver, SpiDriverConfig,
   config::{Config as SpiConfig, BitOrder},
@@ -34,6 +41,7 @@ use esp_idf_svc::hal::prelude::*;
 #[cfg(feature = "radar")]
 use esp_idf_svc::hal::uart::{self, UartDriver};
 use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::*;
 
 #[cfg(feature = "display")]
@@ -45,7 +53,8 @@ use watercontroller::sen0676::{DEFAULT_ADDRESS, Sen0676};
 #[cfg(feature = "pressure")]
 use watercontroller::pressure::PressureSensor;
 #[cfg(feature = "mqtt")]
-use watercontroller::homeassistant::{HomeAssistant, WaterState};
+use watercontroller::homeassistant::{ConfigCommand, HomeAssistant, WaterState};
+use watercontroller::config::Config;
 
 /// Network events communicated from event callbacks to main loop
 #[cfg(feature = "ethernet")]
@@ -83,6 +92,13 @@ fn main() -> anyhow::Result<()> {
 
   let peripherals = Peripherals::take()?;
   let sysloop = EspSystemEventLoop::take()?;
+
+  // ============================================================
+  // NVS configuration
+  // ============================================================
+  let nvs_partition = EspDefaultNvsPartition::take()?;
+  #[cfg_attr(not(feature = "mqtt"), allow(unused_mut))]
+  let mut config = Config::load(nvs_partition)?;
 
   // ============================================================
   // Display initialization (feature: display) - hardware SPI
@@ -131,7 +147,7 @@ fn main() -> anyhow::Result<()> {
   // Ethernet initialization (feature: ethernet)
   // ============================================================
   #[cfg(feature = "ethernet")]
-  let (rx, _eth, _eth_subscription, _ip_subscription) = {
+  let (rx, _ip_addr, _eth, _eth_subscription, _ip_subscription) = {
     // RTL8201 PHY for wESP32 rev7+
     // Pin mapping:
     //   MDC: GPIO16, MDIO: GPIO17, Clock: GPIO0 (input from PHY), PHY Address: 0
@@ -225,7 +241,7 @@ fn main() -> anyhow::Result<()> {
     info!("  IP address: {}", ip);
     info!("  Gateway: {}", gateway);
 
-    (rx, eth, eth_subscription, ip_subscription)
+    (rx, ip, eth, eth_subscription, ip_subscription)
   };
 
   // ============================================================
@@ -270,14 +286,80 @@ fn main() -> anyhow::Result<()> {
   // MQTT / Home Assistant initialization (feature: mqtt)
   // ============================================================
   #[cfg(feature = "mqtt")]
-  let mut ha_client = {
+  let (mut ha_client, cmd_rx) = {
     info!("Initializing MQTT client for Home Assistant...");
-    let mut client = HomeAssistant::new()?;
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ConfigCommand>();
+    let mut client = HomeAssistant::new(cmd_tx)?;
     // Give MQTT time to connect before sending discovery
     thread::sleep(Duration::from_secs(2));
     client.send_discovery()?;
+    client.subscribe()?;
     info!("Home Assistant MQTT ready");
-    client
+    (client, cmd_rx)
+  };
+
+  // ============================================================
+  // Boot info screen (feature: display)
+  // ============================================================
+  #[cfg(feature = "display")]
+  let mut info_until: Option<std::time::Instant> = {
+    use core::fmt::Write;
+
+    let text_style = MonoTextStyleBuilder::new()
+      .font(&FONT_10X20)
+      .text_color(BinaryColor::Off)
+      .build();
+
+    display.clear_framebuffer();
+
+    let mut y = 30i32;
+    let x = 10;
+    let line_height = 26i32;
+
+    let mut line_buf = [0u8; 40];
+
+    // Version
+    let mut w = LineBuf::new(&mut line_buf);
+    let _ = write!(w, "Water Controller v{}", env!("CARGO_PKG_VERSION"));
+    let len = w.pos;
+    Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
+      .draw(&mut display)?;
+    y += line_height;
+
+    // IP address
+    #[cfg(feature = "ethernet")]
+    {
+      let mut w = LineBuf::new(&mut line_buf);
+      let _ = write!(w, "IP: {}", _ip_addr);
+      let len = w.pos;
+      Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
+        .draw(&mut display)?;
+      y += line_height;
+    }
+
+    y += line_height / 2; // gap before parameters
+
+    // Config parameters
+    for (label, value, unit) in [
+      ("Tank", config.tank_capacity_gallons, "gal"),
+      ("Height", config.sensor_height_feet, "ft"),
+      ("Max PSI", config.max_psi, ""),
+      ("Radar", config.radar_height_cm, "cm"),
+    ] {
+      let mut w = LineBuf::new(&mut line_buf);
+      if unit.is_empty() {
+        let _ = write!(w, "{}: {}", label, value);
+      } else {
+        let _ = write!(w, "{}: {} {}", label, value, unit);
+      }
+      let len = w.pos;
+      Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
+        .draw(&mut display)?;
+      y += line_height;
+    }
+
+    display.flush()?;
+    Some(std::time::Instant::now() + Duration::from_secs(2))
   };
 
   // ============================================================
@@ -322,6 +404,78 @@ fn main() -> anyhow::Result<()> {
       }
     }
 
+    // Process MQTT configuration commands
+    #[cfg(feature = "mqtt")]
+    while let Ok(cmd) = cmd_rx.try_recv() {
+      let msg: Option<&str> = match cmd {
+        ConfigCommand::SetTankCapacity(val) => {
+          if let Err(e) = config.set_tank_capacity(val) {
+            warn!("Failed to set tank capacity: {:?}", e);
+          }
+          Some("Tank Capacity")
+        }
+        ConfigCommand::SetSensorHeight(val) => {
+          if let Err(e) = config.set_sensor_height(val) {
+            warn!("Failed to set sensor height: {:?}", e);
+          }
+          Some("Sensor Height")
+        }
+        ConfigCommand::SetMaxPsi(val) => {
+          if let Err(e) = config.set_max_psi(val) {
+            warn!("Failed to set max PSI: {:?}", e);
+          }
+          Some("Max PSI")
+        }
+        ConfigCommand::SetRadarHeight(val) => {
+          if let Err(e) = config.set_radar_height(val) {
+            warn!("Failed to set radar height: {:?}", e);
+          }
+          Some("Radar Height")
+        }
+      };
+
+      // Show config change on display
+      #[cfg(feature = "display")]
+      if let Some(label) = msg {
+        use core::fmt::Write;
+
+        let text_style = MonoTextStyleBuilder::new()
+          .font(&FONT_10X20)
+          .text_color(BinaryColor::Off)
+          .build();
+
+        display.clear_framebuffer();
+
+        let mut line_buf = [0u8; 40];
+        let value = match label {
+          "Tank Capacity" => config.tank_capacity_gallons,
+          "Sensor Height" => config.sensor_height_feet,
+          "Max PSI" => config.max_psi,
+          "Radar Height" => config.radar_height_cm,
+          _ => 0,
+        };
+        let unit = match label {
+          "Tank Capacity" => " gal",
+          "Sensor Height" => " ft",
+          "Radar Height" => " cm",
+          _ => "",
+        };
+        let mut w = LineBuf::new(&mut line_buf);
+        let _ = write!(w, "{}: {}{}", label, value, unit);
+        let len = w.pos;
+        Text::new(
+          unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) },
+          Point::new(10, 120),
+          text_style,
+        ).draw(&mut display)?;
+
+        display.flush()?;
+        info_until = Some(std::time::Instant::now() + Duration::from_secs(2));
+      }
+      #[cfg(not(feature = "display"))]
+      let _ = msg;
+    }
+
     // Read radar sensor
     #[cfg(feature = "radar")]
     match radar.read_empty_height() {
@@ -331,7 +485,7 @@ fn main() -> anyhow::Result<()> {
 
     // Read pressure sensor
     #[cfg(feature = "pressure")]
-    let current_psi = match pressure_sensor.read_psi_u16() {
+    let current_psi = match pressure_sensor.read_psi_u16(config.sensor_height_feet as f32) {
       Ok(psi) => {
         debug!("Pressure: {} PSI", psi);
         psi
@@ -342,6 +496,7 @@ fn main() -> anyhow::Result<()> {
       }
     };
     #[cfg(not(feature = "pressure"))]
+    #[cfg_attr(not(feature = "mqtt"), allow(unused_variables))]
     let current_psi: u16 = 0;
 
     // Demo animation for tank (will be replaced with radar data)
@@ -360,9 +515,9 @@ fn main() -> anyhow::Result<()> {
       }
     }
 
-    // Calculate gallons (assuming 500 gallon tank capacity)
+    // Calculate gallons from config tank capacity
     #[cfg(any(feature = "display", feature = "mqtt"))]
-    let gallons = (500u32 * demo_percent as u32 / 100) as u16;
+    let gallons = (config.tank_capacity_gallons as u32 * demo_percent as u32 / 100) as u16;
 
     // Publish to Home Assistant via MQTT
     #[cfg(feature = "mqtt")]
@@ -372,6 +527,10 @@ fn main() -> anyhow::Result<()> {
         capacity_percent: demo_percent,
         capacity_gallons: gallons,
         pressure_psi: current_psi,
+        tank_capacity: config.tank_capacity_gallons,
+        sensor_height: config.sensor_height_feet,
+        max_psi: config.max_psi,
+        radar_height: config.radar_height_cm,
       };
       if let Err(e) = ha_client.publish_state(&state) {
         warn!("MQTT publish error: {:?}", e);
@@ -381,30 +540,71 @@ fn main() -> anyhow::Result<()> {
     // Update display
     #[cfg(feature = "display")]
     {
-      // Get pressure value (real sensor or demo)
-      #[cfg(feature = "pressure")]
-      let psi = current_psi;
-      #[cfg(not(feature = "pressure"))]
-      let psi = {
-        if demo_rising {
-          demo_psi = demo_psi.saturating_add(8);
-        } else {
-          demo_psi = demo_psi.saturating_sub(8);
+      // Check if info overlay is active
+      let showing_info = match info_until {
+        Some(until) if std::time::Instant::now() < until => true,
+        Some(_) => {
+          // Info expired, clear and resume normal display
+          info_until = None;
+          display.clear_framebuffer();
+          display.mark_all_dirty();
+          false
         }
-        demo_psi.min(150)
+        None => false,
       };
 
-      // Update UI component values
-      tank.set_level(demo_percent, gallons);
-      manometer.set_pressure(psi.min(150));
+      if !showing_info {
+        // Get pressure value (real sensor or demo)
+        #[cfg(feature = "pressure")]
+        let psi = current_psi;
+        #[cfg(not(feature = "pressure"))]
+        let psi = {
+          if demo_rising {
+            demo_psi = demo_psi.saturating_add(8);
+          } else {
+            demo_psi = demo_psi.saturating_sub(8);
+          }
+          demo_psi.min(config.max_psi)
+        };
 
-      // Draw UI (components clear their own areas)
-      tank.draw(&mut display)?;
-      manometer.draw(&mut display)?;
-      display.flush()?;
+        // Update UI component values
+        tank.set_level(demo_percent, gallons);
+        manometer.set_pressure(psi.min(config.max_psi));
+
+        // Draw UI (components clear their own areas)
+        tank.draw(&mut display)?;
+        manometer.draw(&mut display)?;
+        display.flush()?;
+      }
     }
 
     thread::sleep(Duration::from_millis(200));
+  }
+}
+
+/// Helper for formatting text into a fixed buffer without allocation
+#[cfg(feature = "display")]
+struct LineBuf<'a> {
+  buf: &'a mut [u8],
+  pos: usize,
+}
+
+#[cfg(feature = "display")]
+impl<'a> LineBuf<'a> {
+  fn new(buf: &'a mut [u8]) -> Self {
+    Self { buf, pos: 0 }
+  }
+}
+
+#[cfg(feature = "display")]
+impl core::fmt::Write for LineBuf<'_> {
+  fn write_str(&mut self, s: &str) -> core::fmt::Result {
+    let bytes = s.as_bytes();
+    let remaining = self.buf.len() - self.pos;
+    let len = bytes.len().min(remaining);
+    self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
+    self.pos += len;
+    Ok(())
   }
 }
 

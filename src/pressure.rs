@@ -35,9 +35,6 @@ const SENSOR_MAX_MV: f32 = 4500.0;
 /// Sensor pressure range
 const SENSOR_MAX_PSI: f32 = 100.0;
 
-/// Sensor height above ground level in feet
-/// Used to compensate for hydrostatic pressure difference
-const SENSOR_HEIGHT_FEET: f32 = 11.0;
 /// PSI per foot of water column (hydrostatic pressure)
 const PSI_PER_FOOT: f32 = 0.433;
 
@@ -85,7 +82,10 @@ impl<'d> PressureSensor<'d> {
     ///
     /// Returns pressure clamped to 0-100 PSI range.
     /// Includes averaging for stability.
-    pub fn read_psi(&mut self) -> Result<f32, esp_idf_svc::sys::EspError> {
+    ///
+    /// # Arguments
+    /// * `height_feet` - Sensor height above ground level in feet (for hydrostatic compensation)
+    pub fn read_psi(&mut self, height_feet: f32) -> Result<f32, esp_idf_svc::sys::EspError> {
         // Average multiple readings for stability
         const SAMPLES: u32 = 8;
         let mut sum: u32 = 0;
@@ -103,15 +103,15 @@ impl<'d> PressureSensor<'d> {
         let psi = (sensor_mv - SENSOR_MIN_MV) / (SENSOR_MAX_MV - SENSOR_MIN_MV) * SENSOR_MAX_PSI;
 
         // Compensate for sensor height above ground level
-        let psi = psi + (SENSOR_HEIGHT_FEET * PSI_PER_FOOT);
+        let psi = psi + (height_feet * PSI_PER_FOOT);
 
         // Clamp to valid range
         Ok(psi.clamp(0.0, SENSOR_MAX_PSI))
     }
 
     /// Read pressure as integer PSI (rounded)
-    pub fn read_psi_u16(&mut self) -> Result<u16, esp_idf_svc::sys::EspError> {
-        let psi = self.read_psi()?;
+    pub fn read_psi_u16(&mut self, height_feet: f32) -> Result<u16, esp_idf_svc::sys::EspError> {
+        let psi = self.read_psi(height_feet)?;
         Ok(psi.round() as u16)
     }
 }

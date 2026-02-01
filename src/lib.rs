@@ -1,3 +1,5 @@
+pub mod config;
+
 #[cfg(feature = "display")]
 pub mod ls027b7dh01;
 
