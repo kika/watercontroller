@@ -12,3 +12,6 @@ target = "xtensa-esp32-espidf"
 
 [unstable]
 build-std = ["std", "panic_abort"]
+
+[alias]
+erase-nvs = "espflash erase-region 0x9000 0x6000"

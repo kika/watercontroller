@@ -16,9 +16,6 @@ use std::sync::{Arc, Mutex};
 use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttEvent, MqttClientConfiguration, QoS};
 use log::*;
 
-/// Default MQTT port
-const MQTT_PORT: u16 = 1883;
-
 /// Device identifier for Home Assistant
 const DEVICE_ID: &str = "watercontroller";
 
@@ -69,14 +66,20 @@ impl HomeAssistant {
     ///
     /// Commands received on `watercontroller/set/*` topics are parsed and
     /// forwarded to the main loop via the provided `cmd_tx` channel.
-    pub fn new(cmd_tx: Sender<ConfigCommand>) -> Result<Self, esp_idf_svc::sys::EspError> {
-        let broker_url = format!("mqtt://homeassistant.local:{}", MQTT_PORT);
+    pub fn new(
+        broker: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        cmd_tx: Sender<ConfigCommand>,
+    ) -> Result<Self, esp_idf_svc::sys::EspError> {
+        let broker_url = format!("mqtt://{}:{}", broker, port);
         info!("Connecting to MQTT broker at {}", broker_url);
 
         let mqtt_config = MqttClientConfiguration {
             client_id: Some(DEVICE_ID),
-            username: Some("watercontroller"),
-            password: Some("watercontroller"),
+            username: if username.is_empty() { None } else { Some(username) },
+            password: if password.is_empty() { None } else { Some(password) },
             ..Default::default()
         };
 

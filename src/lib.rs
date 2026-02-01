@@ -14,3 +14,6 @@ pub mod pressure;
 
 #[cfg(feature = "mqtt")]
 pub mod homeassistant;
+
+#[cfg(feature = "ethernet")]
+pub mod web;

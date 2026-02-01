@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -55,6 +56,8 @@ use watercontroller::pressure::PressureSensor;
 #[cfg(feature = "mqtt")]
 use watercontroller::homeassistant::{ConfigCommand, HomeAssistant, WaterState};
 use watercontroller::config::Config;
+#[cfg(feature = "ethernet")]
+use watercontroller::web::WebServer;
 
 /// Network events communicated from event callbacks to main loop
 #[cfg(feature = "ethernet")]
@@ -107,8 +110,7 @@ fn run() -> anyhow::Result<()> {
   // NVS configuration
   // ============================================================
   let nvs_partition = EspDefaultNvsPartition::take()?;
-  #[cfg_attr(not(feature = "mqtt"), allow(unused_mut))]
-  let mut config = Config::load(nvs_partition)?;
+  let config = Arc::new(Mutex::new(Config::load(nvs_partition)?));
 
   // ============================================================
   // Display initialization (feature: display) - hardware SPI
@@ -303,44 +305,54 @@ fn run() -> anyhow::Result<()> {
   };
 
   // ============================================================
+  // Web server (feature: ethernet) — always available for config
+  // ============================================================
+  #[cfg(feature = "ethernet")]
+  let _web_server = WebServer::start(config.clone())?;
+
+  // ============================================================
   // MQTT / Home Assistant initialization (feature: mqtt)
   // ============================================================
   #[cfg(feature = "mqtt")]
   let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ConfigCommand>();
 
   #[cfg(feature = "mqtt")]
-  let mqtt_broker = "homeassistant.local";
+  let mqtt_configured = config.lock().unwrap().mqtt_configured();
 
-  // Verify DNS resolution before attempting MQTT connection
   #[cfg(feature = "mqtt")]
-  {
-    use std::net::ToSocketAddrs;
+  let mut ha_client: Option<HomeAssistant> = if mqtt_configured {
+    let (broker, port, username, password) = {
+      let cfg = config.lock().unwrap();
+      (cfg.mqtt_broker.clone(), cfg.mqtt_port, cfg.mqtt_username.clone(), cfg.mqtt_password.clone())
+    };
 
-    info!("Resolving {}...", mqtt_broker);
-    let mut resolved = false;
-    for attempt in 1..=5 {
-      match (mqtt_broker, 1883u16).to_socket_addrs() {
-        Ok(addrs) => {
-          let addrs: Vec<_> = addrs.collect();
-          info!("DNS resolved {} -> {:?}", mqtt_broker, addrs);
-          resolved = true;
-          break;
-        }
-        Err(e) => {
-          warn!("DNS attempt {}/5 failed: {}", attempt, e);
-          thread::sleep(Duration::from_secs(2));
+    // Verify DNS resolution before attempting MQTT connection
+    {
+      use std::net::ToSocketAddrs;
+
+      info!("Resolving {}...", broker);
+      let mut resolved = false;
+      for attempt in 1..=5 {
+        match (broker.as_str(), port).to_socket_addrs() {
+          Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            info!("DNS resolved {} -> {:?}", broker, addrs);
+            resolved = true;
+            break;
+          }
+          Err(e) => {
+            warn!("DNS attempt {}/5 failed: {}", attempt, e);
+            thread::sleep(Duration::from_secs(2));
+          }
         }
       }
+      if !resolved {
+        anyhow::bail!("DNS: can't resolve {}", broker);
+      }
     }
-    if !resolved {
-      anyhow::bail!("DNS: can't resolve {}", mqtt_broker);
-    }
-  }
 
-  #[cfg(feature = "mqtt")]
-  let mut ha_client = {
     info!("Initializing MQTT client for Home Assistant...");
-    let mut client = HomeAssistant::new(cmd_tx)
+    let mut client = HomeAssistant::new(&broker, port, &username, &password, cmd_tx)
       .map_err(|e| anyhow::anyhow!("MQTT init failed: {}", e))?;
     // Give MQTT time to connect before sending discovery
     thread::sleep(Duration::from_secs(2));
@@ -353,7 +365,10 @@ fn run() -> anyhow::Result<()> {
     client.subscribe()
       .map_err(|e| anyhow::anyhow!("MQTT subscribe failed: {}", e))?;
     info!("Home Assistant MQTT ready");
-    client
+    Some(client)
+  } else {
+    info!("MQTT not configured — visit http://{}/", _ip_addr);
+    None
   };
 
   // ============================================================
@@ -398,19 +413,30 @@ fn run() -> anyhow::Result<()> {
     // MQTT status
     #[cfg(feature = "mqtt")]
     {
-      Text::new("MQTT: connected", Point::new(x, y), text_style)
-        .draw(&mut display)?;
+      if mqtt_configured {
+        if ha_client.is_some() {
+          Text::new("MQTT: connected", Point::new(x, y), text_style)
+            .draw(&mut display)?;
+        }
+      } else {
+        let mut w = LineBuf::new(&mut line_buf);
+        let _ = write!(w, "Setup: http://{}/", _ip_addr);
+        let len = w.pos;
+        Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
+          .draw(&mut display)?;
+      }
       y += line_height;
     }
 
     y += line_height / 2; // gap before parameters
 
     // Config parameters
+    let cfg = config.lock().unwrap();
     for (label, value, unit) in [
-      ("Tank", config.tank_capacity_gallons, "gal"),
-      ("Height", config.sensor_height_feet, "ft"),
-      ("Max PSI", config.max_psi, ""),
-      ("Radar", config.radar_height_cm, "cm"),
+      ("Tank", cfg.tank_capacity_gallons, "gal"),
+      ("Height", cfg.sensor_height_feet, "ft"),
+      ("Max PSI", cfg.max_psi, ""),
+      ("Radar", cfg.radar_height_cm, "cm"),
     ] {
       let mut w = LineBuf::new(&mut line_buf);
       if unit.is_empty() {
@@ -472,74 +498,80 @@ fn run() -> anyhow::Result<()> {
 
     // Process MQTT configuration commands
     #[cfg(feature = "mqtt")]
-    while let Ok(cmd) = cmd_rx.try_recv() {
-      let msg: Option<&str> = match cmd {
-        ConfigCommand::SetTankCapacity(val) => {
-          if let Err(e) = config.set_tank_capacity(val) {
-            warn!("Failed to set tank capacity: {:?}", e);
+    if ha_client.is_some() {
+      while let Ok(cmd) = cmd_rx.try_recv() {
+        let msg: Option<&str> = {
+          let mut cfg = config.lock().unwrap();
+          match cmd {
+            ConfigCommand::SetTankCapacity(val) => {
+              if let Err(e) = cfg.set_tank_capacity(val) {
+                warn!("Failed to set tank capacity: {:?}", e);
+              }
+              Some("Tank Capacity")
+            }
+            ConfigCommand::SetSensorHeight(val) => {
+              if let Err(e) = cfg.set_sensor_height(val) {
+                warn!("Failed to set sensor height: {:?}", e);
+              }
+              Some("Sensor Height")
+            }
+            ConfigCommand::SetMaxPsi(val) => {
+              if let Err(e) = cfg.set_max_psi(val) {
+                warn!("Failed to set max PSI: {:?}", e);
+              }
+              Some("Max PSI")
+            }
+            ConfigCommand::SetRadarHeight(val) => {
+              if let Err(e) = cfg.set_radar_height(val) {
+                warn!("Failed to set radar height: {:?}", e);
+              }
+              Some("Radar Height")
+            }
           }
-          Some("Tank Capacity")
-        }
-        ConfigCommand::SetSensorHeight(val) => {
-          if let Err(e) = config.set_sensor_height(val) {
-            warn!("Failed to set sensor height: {:?}", e);
-          }
-          Some("Sensor Height")
-        }
-        ConfigCommand::SetMaxPsi(val) => {
-          if let Err(e) = config.set_max_psi(val) {
-            warn!("Failed to set max PSI: {:?}", e);
-          }
-          Some("Max PSI")
-        }
-        ConfigCommand::SetRadarHeight(val) => {
-          if let Err(e) = config.set_radar_height(val) {
-            warn!("Failed to set radar height: {:?}", e);
-          }
-          Some("Radar Height")
-        }
-      };
-
-      // Show config change on display
-      #[cfg(feature = "display")]
-      if let Some(label) = msg {
-        use core::fmt::Write;
-
-        let text_style = MonoTextStyleBuilder::new()
-          .font(&FONT_10X20)
-          .text_color(BinaryColor::Off)
-          .build();
-
-        display.clear_framebuffer();
-
-        let mut line_buf = [0u8; 40];
-        let value = match label {
-          "Tank Capacity" => config.tank_capacity_gallons,
-          "Sensor Height" => config.sensor_height_feet,
-          "Max PSI" => config.max_psi,
-          "Radar Height" => config.radar_height_cm,
-          _ => 0,
         };
-        let unit = match label {
-          "Tank Capacity" => " gal",
-          "Sensor Height" => " ft",
-          "Radar Height" => " cm",
-          _ => "",
-        };
-        let mut w = LineBuf::new(&mut line_buf);
-        let _ = write!(w, "{}: {}{}", label, value, unit);
-        let len = w.pos;
-        Text::new(
-          unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) },
-          Point::new(10, 120),
-          text_style,
-        ).draw(&mut display)?;
 
-        display.flush()?;
-        info_until = Some(std::time::Instant::now() + Duration::from_secs(2));
+        // Show config change on display
+        #[cfg(feature = "display")]
+        if let Some(label) = msg {
+          use core::fmt::Write;
+
+          let text_style = MonoTextStyleBuilder::new()
+            .font(&FONT_10X20)
+            .text_color(BinaryColor::Off)
+            .build();
+
+          display.clear_framebuffer();
+
+          let cfg = config.lock().unwrap();
+          let mut line_buf = [0u8; 40];
+          let value = match label {
+            "Tank Capacity" => cfg.tank_capacity_gallons,
+            "Sensor Height" => cfg.sensor_height_feet,
+            "Max PSI" => cfg.max_psi,
+            "Radar Height" => cfg.radar_height_cm,
+            _ => 0,
+          };
+          let unit = match label {
+            "Tank Capacity" => " gal",
+            "Sensor Height" => " ft",
+            "Radar Height" => " cm",
+            _ => "",
+          };
+          let mut w = LineBuf::new(&mut line_buf);
+          let _ = write!(w, "{}: {}{}", label, value, unit);
+          let len = w.pos;
+          Text::new(
+            unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) },
+            Point::new(10, 120),
+            text_style,
+          ).draw(&mut display)?;
+
+          display.flush()?;
+          info_until = Some(std::time::Instant::now() + Duration::from_secs(2));
+        }
+        #[cfg(not(feature = "display"))]
+        let _ = msg;
       }
-      #[cfg(not(feature = "display"))]
-      let _ = msg;
     }
 
     // Read radar sensor
@@ -551,7 +583,7 @@ fn run() -> anyhow::Result<()> {
 
     // Read pressure sensor
     #[cfg(feature = "pressure")]
-    let current_psi = match pressure_sensor.read_psi_u16(config.sensor_height_feet as f32) {
+    let current_psi = match pressure_sensor.read_psi_u16(config.lock().unwrap().sensor_height_feet as f32) {
       Ok(psi) => {
         debug!("Pressure: {} PSI", psi);
         psi
@@ -583,23 +615,30 @@ fn run() -> anyhow::Result<()> {
 
     // Calculate gallons from config tank capacity
     #[cfg(any(feature = "display", feature = "mqtt"))]
-    let gallons = (config.tank_capacity_gallons as u32 * demo_percent as u32 / 100) as u16;
+    let gallons = {
+      let cfg = config.lock().unwrap();
+      (cfg.tank_capacity_gallons as u32 * demo_percent as u32 / 100) as u16
+    };
 
     // Publish to Home Assistant via MQTT
     #[cfg(feature = "mqtt")]
-    if last_mqtt_publish.elapsed() >= MQTT_INTERVAL {
-      last_mqtt_publish = std::time::Instant::now();
-      let state = WaterState {
-        capacity_percent: demo_percent,
-        capacity_gallons: gallons,
-        pressure_psi: current_psi,
-        tank_capacity: config.tank_capacity_gallons,
-        sensor_height: config.sensor_height_feet,
-        max_psi: config.max_psi,
-        radar_height: config.radar_height_cm,
-      };
-      if let Err(e) = ha_client.publish_state(&state) {
-        warn!("MQTT publish error: {:?}", e);
+    if let Some(ref mut client) = ha_client {
+      if last_mqtt_publish.elapsed() >= MQTT_INTERVAL {
+        last_mqtt_publish = std::time::Instant::now();
+        let cfg = config.lock().unwrap();
+        let state = WaterState {
+          capacity_percent: demo_percent,
+          capacity_gallons: gallons,
+          pressure_psi: current_psi,
+          tank_capacity: cfg.tank_capacity_gallons,
+          sensor_height: cfg.sensor_height_feet,
+          max_psi: cfg.max_psi,
+          radar_height: cfg.radar_height_cm,
+        };
+        drop(cfg);
+        if let Err(e) = client.publish_state(&state) {
+          warn!("MQTT publish error: {:?}", e);
+        }
       }
     }
 
@@ -620,6 +659,8 @@ fn run() -> anyhow::Result<()> {
       };
 
       if !showing_info {
+        let max_psi = config.lock().unwrap().max_psi;
+
         // Get pressure value (real sensor or demo)
         #[cfg(feature = "pressure")]
         let psi = current_psi;
@@ -630,12 +671,12 @@ fn run() -> anyhow::Result<()> {
           } else {
             demo_psi = demo_psi.saturating_sub(8);
           }
-          demo_psi.min(config.max_psi)
+          demo_psi.min(max_psi)
         };
 
         // Update UI component values
         tank.set_level(demo_percent, gallons);
-        manometer.set_pressure(psi.min(config.max_psi));
+        manometer.set_pressure(psi.min(max_psi));
 
         // Draw UI (components clear their own areas)
         tank.draw(&mut display)?;
