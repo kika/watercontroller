@@ -24,6 +24,7 @@ const CMD_TOPIC_TANK_CAPACITY: &str = "watercontroller/set/tank_capacity";
 const CMD_TOPIC_SENSOR_HEIGHT: &str = "watercontroller/set/sensor_height";
 const CMD_TOPIC_MAX_PSI: &str = "watercontroller/set/max_psi";
 const CMD_TOPIC_RADAR_HEIGHT: &str = "watercontroller/set/radar_height";
+const CMD_TOPIC_RADAR_DEADZONE: &str = "watercontroller/set/radar_deadzone";
 
 /// Configuration command received from Home Assistant
 #[derive(Debug)]
@@ -32,6 +33,7 @@ pub enum ConfigCommand {
     SetSensorHeight(u16),
     SetMaxPsi(u16),
     SetRadarHeight(u16),
+    SetRadarDeadzone(u16),
 }
 
 /// Home Assistant MQTT client wrapper
@@ -59,6 +61,8 @@ pub struct WaterState {
     pub max_psi: u16,
     /// Configured radar installation height (cm)
     pub radar_height: u16,
+    /// Configured radar deadzone (cm) — distance from sensor to max water level
+    pub radar_deadzone: u16,
 }
 
 impl HomeAssistant {
@@ -129,6 +133,7 @@ impl HomeAssistant {
                     CMD_TOPIC_SENSOR_HEIGHT => ConfigCommand::SetSensorHeight(value),
                     CMD_TOPIC_MAX_PSI => ConfigCommand::SetMaxPsi(value),
                     CMD_TOPIC_RADAR_HEIGHT => ConfigCommand::SetRadarHeight(value),
+                    CMD_TOPIC_RADAR_DEADZONE => ConfigCommand::SetRadarDeadzone(value),
                     _ => {
                         debug!("MQTT: unknown topic {}", topic);
                         return;
@@ -204,6 +209,7 @@ impl HomeAssistant {
         self.client.subscribe(CMD_TOPIC_SENSOR_HEIGHT, QoS::AtLeastOnce)?;
         self.client.subscribe(CMD_TOPIC_MAX_PSI, QoS::AtLeastOnce)?;
         self.client.subscribe(CMD_TOPIC_RADAR_HEIGHT, QoS::AtLeastOnce)?;
+        self.client.subscribe(CMD_TOPIC_RADAR_DEADZONE, QoS::AtLeastOnce)?;
         info!("Subscribed to command topics");
         Ok(())
     }
@@ -296,6 +302,16 @@ impl HomeAssistant {
             ),
         )?;
 
+        // Radar deadzone (distance from sensor to max water level)
+        self.publish_discovery(
+            "number",
+            "radar_deadzone",
+            &format!(
+                r#"{{"name":"Radar Deadzone","uniq_id":"wc_radar_dz","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.radar_deadzone }}}}","cmd_t":"watercontroller/set/radar_deadzone","min":0,"max":200,"step":1,"mode":"box","unit_of_meas":"cm","ic":"mdi:arrow-collapse-down",{}}}"#,
+                device_info
+            ),
+        )?;
+
         self.discovery_sent = true;
         info!("Discovery messages sent");
         Ok(())
@@ -327,14 +343,15 @@ impl HomeAssistant {
         }
 
         let payload = format!(
-            r#"{{"capacity_pct":{},"gallons":{},"pressure_psi":{},"tank_capacity":{},"sensor_height":{},"max_psi":{},"radar_height":{}}}"#,
+            r#"{{"capacity_pct":{},"gallons":{},"pressure_psi":{},"tank_capacity":{},"sensor_height":{},"max_psi":{},"radar_height":{},"radar_deadzone":{}}}"#,
             state.capacity_percent,
             state.capacity_gallons,
             state.pressure_psi,
             state.tank_capacity,
             state.sensor_height,
             state.max_psi,
-            state.radar_height
+            state.radar_height,
+            state.radar_deadzone
         );
 
         debug!("Publishing state: {}", payload);

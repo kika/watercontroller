@@ -13,6 +13,7 @@ const KEY_TANK_CAPACITY: &str = "tank_cap";
 const KEY_SENSOR_HEIGHT: &str = "height_ft";
 const KEY_MAX_PSI: &str = "max_psi";
 const KEY_RADAR_HEIGHT: &str = "radar_ht_cm";
+const KEY_RADAR_DEADZONE: &str = "radar_dz_cm";
 const KEY_MQTT_BROKER: &str = "mqtt_host";
 const KEY_MQTT_PORT: &str = "mqtt_port";
 const KEY_MQTT_USERNAME: &str = "mqtt_user";
@@ -23,6 +24,7 @@ const DEFAULT_TANK_CAPACITY: u16 = 500;
 const DEFAULT_SENSOR_HEIGHT: u16 = 11;
 const DEFAULT_MAX_PSI: u16 = 150;
 const DEFAULT_RADAR_HEIGHT: u16 = 200;
+const DEFAULT_RADAR_DEADZONE: u16 = 20;
 const DEFAULT_MQTT_PORT: u16 = 1883;
 
 /// Persistent configuration
@@ -32,6 +34,7 @@ pub struct Config {
     pub sensor_height_feet: u16,
     pub max_psi: u16,
     pub radar_height_cm: u16,
+    pub radar_deadzone_cm: u16,
     pub mqtt_broker: String,
     pub mqtt_port: u16,
     pub mqtt_username: String,
@@ -55,6 +58,9 @@ impl Config {
         let radar_height_cm = nvs
             .get_u16(KEY_RADAR_HEIGHT)?
             .unwrap_or(DEFAULT_RADAR_HEIGHT);
+        let radar_deadzone_cm = nvs
+            .get_u16(KEY_RADAR_DEADZONE)?
+            .unwrap_or(DEFAULT_RADAR_DEADZONE);
 
         let mut buf = [0u8; 128];
         let mqtt_broker = nvs.get_str(KEY_MQTT_BROKER, &mut buf)?
@@ -67,8 +73,8 @@ impl Config {
             .unwrap_or("").to_string();
 
         info!(
-            "Config loaded: tank={}gal, height={}ft, max_psi={}, radar={}cm",
-            tank_capacity_gallons, sensor_height_feet, max_psi, radar_height_cm
+            "Config loaded: tank={}gal, height={}ft, max_psi={}, radar={}cm, deadzone={}cm",
+            tank_capacity_gallons, sensor_height_feet, max_psi, radar_height_cm, radar_deadzone_cm
         );
         if mqtt_broker.is_empty() {
             info!("MQTT: not configured");
@@ -82,6 +88,7 @@ impl Config {
             sensor_height_feet,
             max_psi,
             radar_height_cm,
+            radar_deadzone_cm,
             mqtt_broker,
             mqtt_port,
             mqtt_username,
@@ -134,6 +141,18 @@ impl Config {
         self.radar_height_cm = cm;
         self.nvs.set_u16(KEY_RADAR_HEIGHT, cm)?;
         info!("Config: radar height = {} cm", cm);
+        Ok(())
+    }
+
+    /// Set radar deadzone and persist to NVS
+    pub fn set_radar_deadzone(
+        &mut self,
+        cm: u16,
+    ) -> Result<(), esp_idf_svc::sys::EspError> {
+        let cm = cm.clamp(0, 200);
+        self.radar_deadzone_cm = cm;
+        self.nvs.set_u16(KEY_RADAR_DEADZONE, cm)?;
+        info!("Config: radar deadzone = {} cm", cm);
         Ok(())
     }
 

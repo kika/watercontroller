@@ -549,6 +549,12 @@ fn run() -> anyhow::Result<()> {
               }
               Some("Radar Height")
             }
+            ConfigCommand::SetRadarDeadzone(val) => {
+              if let Err(e) = cfg.set_radar_deadzone(val) {
+                warn!("Failed to set radar deadzone: {:?}", e);
+              }
+              Some("Radar Deadzone")
+            }
           }
         };
 
@@ -571,12 +577,13 @@ fn run() -> anyhow::Result<()> {
             "Sensor Height" => cfg.sensor_height_feet,
             "Max PSI" => cfg.max_psi,
             "Radar Height" => cfg.radar_height_cm,
+            "Radar Deadzone" => cfg.radar_deadzone_cm,
             _ => 0,
           };
           let unit = match label {
             "Tank Capacity" => " gal",
             "Sensor Height" => " ft",
-            "Radar Height" => " cm",
+            "Radar Height" | "Radar Deadzone" => " cm",
             _ => "",
           };
           let mut w = LineBuf::new(&mut line_buf);
@@ -604,17 +611,23 @@ fn run() -> anyhow::Result<()> {
       #[cfg(feature = "radar")]
       {
         match radar.read_empty_height() {
-          Ok(height) => {
+          Ok(empty_mm) => {
             let cfg = config.lock().unwrap();
             let install_mm = cfg.radar_height_cm as u32 * 10;
-            let water_mm = install_mm.saturating_sub(height as u32);
-            capacity_percent = if install_mm > 0 {
-              (water_mm * 100 / install_mm).min(100) as u8
+            let deadzone_mm = cfg.radar_deadzone_cm as u32 * 10;
+            // useful_mm = max water depth (from 100% level to bottom)
+            let useful_mm = install_mm.saturating_sub(deadzone_mm);
+            // water_mm = actual water depth (from surface to bottom)
+            let water_mm = install_mm.saturating_sub(empty_mm as u32);
+            capacity_percent = if useful_mm > 0 {
+              // empty_mm == deadzone_mm → water_mm == useful_mm → 100%
+              // empty_mm == install_mm  → water_mm == 0          → 0%
+              (water_mm * 100 / useful_mm).min(100) as u8
             } else {
               0
             };
             gallons = (cfg.tank_capacity_gallons as u32 * capacity_percent as u32 / 100) as u16;
-            info!("Radar: empty {} mm, water {} mm, {}%, {} gal", height, water_mm, capacity_percent, gallons);
+            info!("Radar: empty {} mm, water {} mm / {} mm, {}%, {} gal", empty_mm, water_mm, useful_mm, capacity_percent, gallons);
           }
           Err(e) => warn!("Radar read error: {:?}", e),
         }
@@ -674,6 +687,7 @@ fn run() -> anyhow::Result<()> {
             sensor_height: cfg.sensor_height_feet,
             max_psi: cfg.max_psi,
             radar_height: cfg.radar_height_cm,
+            radar_deadzone: cfg.radar_deadzone_cm,
           };
           drop(cfg);
           if let Err(e) = client.publish_state(&state) {
