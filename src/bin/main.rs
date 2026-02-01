@@ -5,7 +5,7 @@ use std::time::Duration;
 #[cfg(feature = "ethernet")]
 use std::net::Ipv4Addr;
 #[cfg(feature = "ethernet")]
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 
 #[cfg(feature = "display")]
 use embedded_graphics::geometry::{Point, Size};
@@ -441,6 +441,9 @@ fn run() -> anyhow::Result<()> {
   // ============================================================
   info!("Entering main loop...");
 
+  #[cfg(feature = "ethernet")]
+  let mut network_up = true;
+
   // Demo values (will be replaced with real sensor data)
   #[cfg(any(feature = "display", feature = "mqtt"))]
   let mut demo_percent: u8 = 0;
@@ -458,23 +461,46 @@ fn run() -> anyhow::Result<()> {
   loop {
     // Check for network events (non-blocking)
     #[cfg(feature = "ethernet")]
-    match rx.try_recv() {
-      Ok(NetEvent::LinkDown) | Ok(NetEvent::LostIp) => {
-        warn!("Network lost, waiting for reconnection...");
-        let (ip, gateway) = wait_for_network(&rx)?;
-        info!("Network restored!");
-        info!("  IP address: {}", ip);
-        info!("  Gateway: {}", gateway);
-      }
-      Ok(NetEvent::GotIp { ip, gateway }) => {
-        info!("IP address changed: {} (gateway: {})", ip, gateway);
-      }
-      Ok(NetEvent::LinkUp) => {
-        info!("Ethernet link restored");
-      }
-      Err(TryRecvError::Empty) => {}
-      Err(TryRecvError::Disconnected) => {
-        anyhow::bail!("Event channel disconnected");
+    while let Ok(event) = rx.try_recv() {
+      match event {
+        NetEvent::LinkDown => {
+          warn!("Ethernet link lost");
+          network_up = false;
+          #[cfg(feature = "display")]
+          {
+            display.clear_framebuffer();
+            Text::new("Ethernet disconnected", Point::new(10, 120), boot_text_style)
+              .draw(&mut display).ok();
+            display.flush().ok();
+            info_until = Some(std::time::Instant::now() + Duration::from_secs(3600));
+          }
+        }
+        NetEvent::LostIp => {
+          warn!("IP address lost");
+          network_up = false;
+          #[cfg(feature = "display")]
+          {
+            display.clear_framebuffer();
+            Text::new("Waiting for DHCP...", Point::new(10, 120), boot_text_style)
+              .draw(&mut display).ok();
+            display.flush().ok();
+            info_until = Some(std::time::Instant::now() + Duration::from_secs(3600));
+          }
+        }
+        NetEvent::LinkUp => {
+          info!("Ethernet link restored");
+        }
+        NetEvent::GotIp { ip, gateway } => {
+          info!("Network restored: {} (gateway: {})", ip, gateway);
+          network_up = true;
+          #[cfg(feature = "display")]
+          {
+            // Clear overlay so normal display resumes
+            info_until = None;
+            display.clear_framebuffer();
+            display.mark_all_dirty();
+          }
+        }
       }
     }
 
@@ -613,10 +639,14 @@ fn run() -> anyhow::Result<()> {
       (cfg.tank_capacity_gallons as u32 * demo_percent as u32 / 100) as u16
     };
 
-    // Publish to Home Assistant via MQTT
+    // Publish to Home Assistant via MQTT (skip when network is down)
     #[cfg(feature = "mqtt")]
     if let Some(ref mut client) = ha_client {
-      if last_mqtt_publish.elapsed() >= MQTT_INTERVAL {
+      #[cfg(feature = "ethernet")]
+      let can_publish = network_up;
+      #[cfg(not(feature = "ethernet"))]
+      let can_publish = true;
+      if can_publish && last_mqtt_publish.elapsed() >= MQTT_INTERVAL {
         last_mqtt_publish = std::time::Instant::now();
         let cfg = config.lock().unwrap();
         let state = WaterState {
