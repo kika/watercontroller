@@ -11,6 +11,7 @@
 //! - Commands: `watercontroller/set/<parameter>`
 
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttEvent, MqttClientConfiguration, QoS};
 use log::*;
@@ -40,6 +41,8 @@ pub enum ConfigCommand {
 pub struct HomeAssistant {
     client: EspMqttClient<'static>,
     discovery_sent: bool,
+    /// Last connection error from the MQTT event callback
+    conn_error: Arc<Mutex<Option<String>>>,
 }
 
 /// Sensor state to publish
@@ -72,14 +75,19 @@ impl HomeAssistant {
 
         let mqtt_config = MqttClientConfiguration {
             client_id: Some(DEVICE_ID),
+            username: Some("watercontroller"),
+            password: Some("watercontroller"),
             ..Default::default()
         };
+
+        let conn_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let conn_error_cb = conn_error.clone();
 
         let client = EspMqttClient::new_cb(
             &broker_url,
             &mqtt_config,
             move |event| {
-                Self::handle_event(&event, &cmd_tx);
+                Self::handle_event(&event, &cmd_tx, &conn_error_cb);
             },
         )?;
 
@@ -88,11 +96,16 @@ impl HomeAssistant {
         Ok(Self {
             client,
             discovery_sent: false,
+            conn_error,
         })
     }
 
     /// Handle incoming MQTT events
-    fn handle_event(event: &EspMqttEvent, cmd_tx: &Sender<ConfigCommand>) {
+    fn handle_event(
+        event: &EspMqttEvent,
+        cmd_tx: &Sender<ConfigCommand>,
+        conn_error: &Arc<Mutex<Option<String>>>,
+    ) {
         use esp_idf_svc::mqtt::client::EventPayload;
 
         match event.payload() {
@@ -124,12 +137,61 @@ impl HomeAssistant {
             }
             EventPayload::Connected(_) => {
                 info!("MQTT connected");
+                // Clear any previous error on successful connection
+                if let Ok(mut err) = conn_error.lock() {
+                    *err = None;
+                }
             }
             EventPayload::Disconnected => {
                 warn!("MQTT disconnected");
             }
+            EventPayload::Error(_) => {
+                // Extract detailed error from the raw event's error_handle
+                let msg = Self::extract_error_detail(event);
+                warn!("MQTT error: {}", msg);
+                if let Ok(mut err) = conn_error.lock() {
+                    *err = Some(msg);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Extract a human-readable error from the raw MQTT event
+    fn extract_error_detail(event: &EspMqttEvent) -> String {
+        // EspMqttEvent is a newtype: struct EspMqttEvent<'a>(&'a esp_mqtt_event_t)
+        // We transmute to get the inner pointer since the field is private.
+        // Safety: EspMqttEvent is a single-field newtype wrapping a reference.
+        let raw: &esp_idf_svc::sys::esp_mqtt_event_t =
+            unsafe { std::mem::transmute_copy::<EspMqttEvent, &esp_idf_svc::sys::esp_mqtt_event_t>(event) };
+
+        if raw.error_handle.is_null() {
+            return "Unknown error".to_string();
+        }
+
+        let err = unsafe { &*raw.error_handle };
+        let sock_errno = err.esp_transport_sock_errno;
+
+        if sock_errno != 0 {
+            // Convert socket errno to string
+            let cstr = unsafe { esp_idf_svc::sys::strerror(sock_errno) };
+            if !cstr.is_null() {
+                let msg = unsafe { std::ffi::CStr::from_ptr(cstr) };
+                return msg.to_string_lossy().into_owned();
+            }
+            return format!("Socket error {}", sock_errno);
+        }
+
+        if err.esp_tls_last_esp_err != 0 {
+            return format!("TLS error 0x{:x}", err.esp_tls_last_esp_err);
+        }
+
+        "Connection failed".to_string()
+    }
+
+    /// Return the last connection error, if any
+    pub fn connection_error(&self) -> Option<String> {
+        self.conn_error.lock().ok().and_then(|e| e.clone())
     }
 
     /// Subscribe to command topics

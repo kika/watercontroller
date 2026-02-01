@@ -78,6 +78,16 @@ fn main() -> anyhow::Result<()> {
   info!("Written by Kirill Pertsev kika@kikap.com in 2026");
   debug!("Debug output enabled");
 
+  let result = run();
+
+  if let Err(ref e) = result {
+    error!("Fatal error: {:#}", e);
+  }
+
+  result
+}
+
+fn run() -> anyhow::Result<()> {
   // Log enabled features
   #[cfg(feature = "display")]
   info!("Feature enabled: display");
@@ -142,6 +152,10 @@ fn main() -> anyhow::Result<()> {
 
   #[cfg(feature = "display")]
   let mut manometer = Manometer::new(Point::new(280, 120), 100);
+
+  // From here on, errors can be shown on the display.
+  // Wrap the rest in a closure so we can catch errors.
+  let result: anyhow::Result<()> = (|| {
 
   // ============================================================
   // Ethernet initialization (feature: ethernet)
@@ -241,6 +255,12 @@ fn main() -> anyhow::Result<()> {
     info!("  IP address: {}", ip);
     info!("  Gateway: {}", gateway);
 
+    // Log DNS servers received from DHCP
+    let dns1 = eth.netif().get_dns();
+    let dns2 = eth.netif().get_secondary_dns();
+    info!("  DNS primary: {}", dns1);
+    info!("  DNS secondary: {}", dns2);
+
     (rx, ip, eth, eth_subscription, ip_subscription)
   };
 
@@ -286,16 +306,54 @@ fn main() -> anyhow::Result<()> {
   // MQTT / Home Assistant initialization (feature: mqtt)
   // ============================================================
   #[cfg(feature = "mqtt")]
-  let (mut ha_client, cmd_rx) = {
+  let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ConfigCommand>();
+
+  #[cfg(feature = "mqtt")]
+  let mqtt_broker = "homeassistant.local";
+
+  // Verify DNS resolution before attempting MQTT connection
+  #[cfg(feature = "mqtt")]
+  {
+    use std::net::ToSocketAddrs;
+
+    info!("Resolving {}...", mqtt_broker);
+    let mut resolved = false;
+    for attempt in 1..=5 {
+      match (mqtt_broker, 1883u16).to_socket_addrs() {
+        Ok(addrs) => {
+          let addrs: Vec<_> = addrs.collect();
+          info!("DNS resolved {} -> {:?}", mqtt_broker, addrs);
+          resolved = true;
+          break;
+        }
+        Err(e) => {
+          warn!("DNS attempt {}/5 failed: {}", attempt, e);
+          thread::sleep(Duration::from_secs(2));
+        }
+      }
+    }
+    if !resolved {
+      anyhow::bail!("DNS: can't resolve {}", mqtt_broker);
+    }
+  }
+
+  #[cfg(feature = "mqtt")]
+  let mut ha_client = {
     info!("Initializing MQTT client for Home Assistant...");
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ConfigCommand>();
-    let mut client = HomeAssistant::new(cmd_tx)?;
+    let mut client = HomeAssistant::new(cmd_tx)
+      .map_err(|e| anyhow::anyhow!("MQTT init failed: {}", e))?;
     // Give MQTT time to connect before sending discovery
     thread::sleep(Duration::from_secs(2));
-    client.send_discovery()?;
-    client.subscribe()?;
+    // Check if connection failed during the wait
+    if let Some(err) = client.connection_error() {
+      anyhow::bail!("MQTT: {}", err);
+    }
+    client.send_discovery()
+      .map_err(|e| anyhow::anyhow!("MQTT discovery failed: {}", e))?;
+    client.subscribe()
+      .map_err(|e| anyhow::anyhow!("MQTT subscribe failed: {}", e))?;
     info!("Home Assistant MQTT ready");
-    (client, cmd_rx)
+    client
   };
 
   // ============================================================
@@ -333,6 +391,14 @@ fn main() -> anyhow::Result<()> {
       let _ = write!(w, "IP: {}", _ip_addr);
       let len = w.pos;
       Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
+        .draw(&mut display)?;
+      y += line_height;
+    }
+
+    // MQTT status
+    #[cfg(feature = "mqtt")]
+    {
+      Text::new("MQTT: connected", Point::new(x, y), text_style)
         .draw(&mut display)?;
       y += line_height;
     }
@@ -580,6 +646,50 @@ fn main() -> anyhow::Result<()> {
 
     thread::sleep(Duration::from_millis(200));
   }
+
+  })(); // end of error-catching closure
+
+  // Show fatal error on display if available
+  #[cfg(feature = "display")]
+  if let Err(ref e) = result {
+    use core::fmt::Write;
+
+    let text_style = MonoTextStyleBuilder::new()
+      .font(&FONT_10X20)
+      .text_color(BinaryColor::Off)
+      .build();
+
+    display.clear_framebuffer();
+
+    Text::new("FATAL ERROR", Point::new(10, 30), text_style)
+      .draw(&mut display).ok();
+
+    // Format error message, truncated to fit display
+    let mut line_buf = [0u8; 60];
+    let mut w = LineBuf::new(&mut line_buf);
+    let _ = write!(w, "{:#}", e);
+    let len = w.pos;
+    let msg = unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) };
+
+    // Split long messages across lines
+    let mut y = 70i32;
+    let chars_per_line = 38; // 400px / 10px per char ≈ 38
+    for chunk in msg.as_bytes().chunks(chars_per_line) {
+      let s = unsafe { core::str::from_utf8_unchecked(chunk) };
+      Text::new(s, Point::new(10, y), text_style)
+        .draw(&mut display).ok();
+      y += 26;
+    }
+
+    display.flush().ok();
+
+    // Keep error visible, then reboot
+    error!("Rebooting in 30 seconds...");
+    thread::sleep(Duration::from_secs(30));
+    unsafe { esp_idf_svc::sys::esp_restart(); }
+  }
+
+  result
 }
 
 /// Helper for formatting text into a fixed buffer without allocation

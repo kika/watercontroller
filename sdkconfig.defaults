@@ -15,6 +15,9 @@ CONFIG_ETH_PHY_INTERFACE_RMII=y
 # LWIP settings for networking
 CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n
 CONFIG_LWIP_IPV4=y
+CONFIG_LWIP_DNS_MAX_SERVERS=3
+# Disable mDNS interception for .local domains so they resolve via regular DNS
+CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=n
 
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
