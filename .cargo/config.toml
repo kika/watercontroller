@@ -1,6 +1,6 @@
 [target.xtensa-esp32-espidf]
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+runner = "espflash flash -B 921600 --monitor"
 
 [env]
 MCU = "esp32"
