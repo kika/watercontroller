@@ -324,7 +324,12 @@ fn run() -> anyhow::Result<()> {
       &uart_config,
     )?;
 
-    let radar = Sen0676::new(uart, DEFAULT_ADDRESS);
+    let mut radar = Sen0676::new(uart, DEFAULT_ADDRESS);
+    let height_cm = config.lock().unwrap().radar_height_cm;
+    match radar.configure_height(height_cm) {
+      Ok(range) => info!("Radar: height {} cm, range {} m", height_cm, range),
+      Err(e) => warn!("Failed to configure radar height: {:?}", e),
+    }
     info!("Radar sensor initialized");
 
     radar
@@ -442,19 +447,25 @@ fn run() -> anyhow::Result<()> {
   #[cfg(feature = "ethernet")]
   let mut network_up = true;
 
-  // Demo values (will be replaced with real sensor data)
-  #[cfg(any(feature = "display", feature = "mqtt"))]
+  // Demo values (only when no real sensors are enabled)
+  #[cfg(all(any(feature = "display", feature = "mqtt"), not(feature = "pressure"), not(feature = "radar")))]
   let mut demo_percent: u8 = 0;
-  #[cfg(all(any(feature = "display", feature = "mqtt"), not(feature = "pressure")))]
+  #[cfg(all(any(feature = "display", feature = "mqtt"), not(feature = "pressure"), not(feature = "radar")))]
   let mut demo_psi: u16 = 0;
-  #[cfg(any(feature = "display", feature = "mqtt"))]
+  #[cfg(all(any(feature = "display", feature = "mqtt"), not(feature = "pressure"), not(feature = "radar")))]
   let mut demo_rising = true;
 
-  // MQTT publish interval
-  #[cfg(feature = "mqtt")]
-  const MQTT_INTERVAL: Duration = Duration::from_secs(5);
-  #[cfg(feature = "mqtt")]
-  let mut last_mqtt_publish = std::time::Instant::now();
+  // Sensor/MQTT update interval (5s — radar needs time to settle)
+  const UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+  let mut last_update = std::time::Instant::now();
+
+  // Current sensor values (persist across loop iterations)
+  #[cfg(any(feature = "display", feature = "mqtt"))]
+  let mut capacity_percent: u8 = 0;
+  #[cfg(any(feature = "display", feature = "mqtt"))]
+  let mut current_psi: u16 = 0;
+  #[cfg(any(feature = "display", feature = "mqtt"))]
+  let mut gallons: u16 = 0;
 
   loop {
     // Check for network events (non-blocking)
@@ -531,6 +542,11 @@ fn run() -> anyhow::Result<()> {
               if let Err(e) = cfg.set_radar_height(val) {
                 warn!("Failed to set radar height: {:?}", e);
               }
+              #[cfg(feature = "radar")]
+              match radar.configure_height(val) {
+                Ok(range) => info!("Radar: height {} cm, range {} m", val, range),
+                Err(e) => warn!("Failed to configure radar height: {:?}", e),
+              }
               Some("Radar Height")
             }
           }
@@ -580,85 +596,89 @@ fn run() -> anyhow::Result<()> {
       }
     }
 
-    // Read radar sensor
-    #[cfg(feature = "radar")]
-    match radar.read_empty_height() {
-      Ok(height) => info!("Empty height: {} mm", height),
-      Err(e) => warn!("Radar read error: {:?}", e),
-    }
+    // Sensor readings and MQTT publish every 5 seconds
+    if last_update.elapsed() >= UPDATE_INTERVAL {
+      last_update = std::time::Instant::now();
 
-    // Read pressure sensor
-    #[cfg(feature = "pressure")]
-    let current_psi = match pressure_sensor.read_psi_u16(config.lock().unwrap().sensor_height_feet as f32) {
-      Ok(psi) => {
-        debug!("Pressure: {} PSI", psi);
-        psi
+      // Read radar sensor
+      #[cfg(feature = "radar")]
+      {
+        match radar.read_empty_height() {
+          Ok(height) => {
+            let cfg = config.lock().unwrap();
+            let install_mm = cfg.radar_height_cm as u32 * 10;
+            let water_mm = install_mm.saturating_sub(height as u32);
+            capacity_percent = if install_mm > 0 {
+              (water_mm * 100 / install_mm).min(100) as u8
+            } else {
+              0
+            };
+            gallons = (cfg.tank_capacity_gallons as u32 * capacity_percent as u32 / 100) as u16;
+            info!("Radar: empty {} mm, water {} mm, {}%, {} gal", height, water_mm, capacity_percent, gallons);
+          }
+          Err(e) => warn!("Radar read error: {:?}", e),
+        }
       }
-      Err(e) => {
-        warn!("Pressure read error: {:?}", e);
-        0
+
+      // Read pressure sensor
+      #[cfg(feature = "pressure")]
+      {
+        current_psi = match pressure_sensor.read_psi_u16(config.lock().unwrap().sensor_height_feet as f32) {
+          Ok(psi) => {
+            debug!("Pressure: {} PSI", psi);
+            psi
+          }
+          Err(e) => {
+            warn!("Pressure read error: {:?}", e);
+            0
+          }
+        };
       }
-    };
-    #[cfg(not(feature = "pressure"))]
-    let current_psi: u16 = {
-      #[cfg(any(feature = "display", feature = "mqtt"))]
+
+      // No pressure sensor — PSI stays at 0
+      #[cfg(not(feature = "pressure"))]
+      { current_psi = 0; }
+
+      // Demo mode (no real sensors)
+      #[cfg(all(not(feature = "pressure"), not(feature = "radar")))]
       {
         if demo_rising {
+          demo_percent = demo_percent.saturating_add(5);
           demo_psi = demo_psi.saturating_add(8);
+          if demo_percent >= 100 { demo_rising = false; }
         } else {
+          demo_percent = demo_percent.saturating_sub(5);
           demo_psi = demo_psi.saturating_sub(8);
+          if demo_percent == 0 { demo_rising = true; }
         }
-        demo_psi.min(config.lock().unwrap().max_psi)
-      }
-      #[cfg(not(any(feature = "display", feature = "mqtt")))]
-      0
-    };
-
-    // Demo animation for tank (will be replaced with radar data)
-    #[cfg(any(feature = "display", feature = "mqtt"))]
-    {
-      if demo_rising {
-        demo_percent = demo_percent.saturating_add(5);
-        if demo_percent >= 100 {
-          demo_rising = false;
-        }
-      } else {
-        demo_percent = demo_percent.saturating_sub(5);
-        if demo_percent == 0 {
-          demo_rising = true;
-        }
-      }
-    }
-
-    // Calculate gallons from config tank capacity
-    #[cfg(any(feature = "display", feature = "mqtt"))]
-    let gallons = {
-      let cfg = config.lock().unwrap();
-      (cfg.tank_capacity_gallons as u32 * demo_percent as u32 / 100) as u16
-    };
-
-    // Publish to Home Assistant via MQTT (skip when network is down)
-    #[cfg(feature = "mqtt")]
-    if let Some(ref mut client) = ha_client {
-      #[cfg(feature = "ethernet")]
-      let can_publish = network_up;
-      #[cfg(not(feature = "ethernet"))]
-      let can_publish = true;
-      if can_publish && last_mqtt_publish.elapsed() >= MQTT_INTERVAL {
-        last_mqtt_publish = std::time::Instant::now();
+        capacity_percent = demo_percent;
+        current_psi = demo_psi.min(config.lock().unwrap().max_psi);
         let cfg = config.lock().unwrap();
-        let state = WaterState {
-          capacity_percent: demo_percent,
-          capacity_gallons: gallons,
-          pressure_psi: current_psi,
-          tank_capacity: cfg.tank_capacity_gallons,
-          sensor_height: cfg.sensor_height_feet,
-          max_psi: cfg.max_psi,
-          radar_height: cfg.radar_height_cm,
-        };
-        drop(cfg);
-        if let Err(e) = client.publish_state(&state) {
-          warn!("MQTT publish error: {:?}", e);
+        gallons = (cfg.tank_capacity_gallons as u32 * capacity_percent as u32 / 100) as u16;
+      }
+
+      // Publish to Home Assistant via MQTT (skip when network is down)
+      #[cfg(feature = "mqtt")]
+      if let Some(ref mut client) = ha_client {
+        #[cfg(feature = "ethernet")]
+        let can_publish = network_up;
+        #[cfg(not(feature = "ethernet"))]
+        let can_publish = true;
+        if can_publish {
+          let cfg = config.lock().unwrap();
+          let state = WaterState {
+            capacity_percent,
+            capacity_gallons: gallons,
+            pressure_psi: current_psi,
+            tank_capacity: cfg.tank_capacity_gallons,
+            sensor_height: cfg.sensor_height_feet,
+            max_psi: cfg.max_psi,
+            radar_height: cfg.radar_height_cm,
+          };
+          drop(cfg);
+          if let Err(e) = client.publish_state(&state) {
+            warn!("MQTT publish error: {:?}", e);
+          }
         }
       }
     }
@@ -683,7 +703,7 @@ fn run() -> anyhow::Result<()> {
         let max_psi = config.lock().unwrap().max_psi;
 
         // Update UI component values
-        tank.set_level(demo_percent, gallons);
+        tank.set_level(capacity_percent, gallons);
         manometer.set_pressure(current_psi.min(max_psi));
 
         // Draw UI (components clear their own areas)

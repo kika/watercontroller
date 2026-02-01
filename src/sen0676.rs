@@ -119,6 +119,14 @@ where
     }
   }
 
+  /// Set installation height, wait for sensor to settle, and log the resulting range
+  pub fn configure_height(&mut self, cm: u16) -> Result<u16, Error> {
+    self.set_installation_height(cm)?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let range = self.read_range()?;
+    Ok(range)
+  }
+
   /// Read the empty height (distance from sensor to liquid surface)
   ///
   /// Returns distance in millimeters (filtered data)
