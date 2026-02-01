@@ -155,6 +155,43 @@ fn run() -> anyhow::Result<()> {
   #[cfg(feature = "display")]
   let mut manometer = Manometer::new(Point::new(280, 120), 100);
 
+  // Boot status display helper
+  #[cfg(feature = "display")]
+  let boot_text_style = MonoTextStyleBuilder::new()
+    .font(&FONT_10X20)
+    .text_color(BinaryColor::Off)
+    .build();
+
+  #[cfg(feature = "display")]
+  let mut boot_line = 0i32;
+
+  /// Show a boot progress line on the display, appending each new line
+  macro_rules! boot_status {
+    ($($arg:tt)*) => {
+      #[cfg(feature = "display")]
+      {
+        use core::fmt::Write;
+        let mut buf = [0u8; 40];
+        let mut w = LineBuf::new(&mut buf);
+        let _ = write!(w, $($arg)*);
+        let len = w.pos;
+        if boot_line == 0 {
+          display.clear_framebuffer();
+        }
+        let y = 26 + boot_line * 26;
+        Text::new(
+          unsafe { core::str::from_utf8_unchecked(&buf[..len]) },
+          Point::new(10, y as i32),
+          boot_text_style,
+        ).draw(&mut display).ok();
+        display.flush().ok();
+        boot_line += 1;
+      }
+    };
+  }
+
+  boot_status!("Water Controller v{}", env!("CARGO_PKG_VERSION"));
+
   // From here on, errors can be shown on the display.
   // Wrap the rest in a closure so we can catch errors.
   let result: anyhow::Result<()> = (|| {
@@ -168,6 +205,7 @@ fn run() -> anyhow::Result<()> {
     // Pin mapping:
     //   MDC: GPIO16, MDIO: GPIO17, Clock: GPIO0 (input from PHY), PHY Address: 0
     //   https://wesp32.com/files/wESP32-Product-Brief.pdf
+    boot_status!("Ethernet...");
     info!("Initializing Ethernet (RTL8201 PHY)...");
 
     let eth_driver = EthDriver::new_rmii(
@@ -251,8 +289,10 @@ fn run() -> anyhow::Result<()> {
     eth.start()?;
 
     // Wait for initial network connection
+    boot_status!("Waiting for DHCP...");
     info!("Waiting for network...");
     let (ip, gateway) = wait_for_network(&rx)?;
+    boot_status!("IP: {}", ip);
     info!("Network ready!");
     info!("  IP address: {}", ip);
     info!("  Gateway: {}", gateway);
@@ -272,6 +312,7 @@ fn run() -> anyhow::Result<()> {
   #[cfg(feature = "radar")]
   let mut radar = {
     // TX: GPIO12, RX: GPIO13, 115200 baud, 8N1
+    boot_status!("Radar sensor...");
     info!("Initializing UART1 for radar sensor...");
     let uart_config = uart::config::Config::default().baudrate(Hertz(115200));
     let uart = UartDriver::new(
@@ -298,6 +339,7 @@ fn run() -> anyhow::Result<()> {
   let mut pressure_sensor = {
     // GPIO36 (A0) with 10k/12k voltage divider
     // Sensor: 0.5V = 0 PSI, 4.5V = 100 PSI
+    boot_status!("Pressure sensor...");
     info!("Initializing pressure sensor on GPIO36...");
     let sensor = PressureSensor::new(peripherals.adc1, peripherals.pins.gpio36)?;
     info!("Pressure sensor ready");
@@ -307,6 +349,7 @@ fn run() -> anyhow::Result<()> {
   // ============================================================
   // Web server (feature: ethernet) — always available for config
   // ============================================================
+  boot_status!("Web server...");
   #[cfg(feature = "ethernet")]
   let _web_server = WebServer::start(config.clone())?;
 
@@ -330,6 +373,7 @@ fn run() -> anyhow::Result<()> {
     {
       use std::net::ToSocketAddrs;
 
+      boot_status!("DNS: {}...", broker);
       info!("Resolving {}...", broker);
       let mut resolved = false;
       for attempt in 1..=5 {
@@ -351,6 +395,7 @@ fn run() -> anyhow::Result<()> {
       }
     }
 
+    boot_status!("MQTT connecting...");
     info!("Initializing MQTT client for Home Assistant...");
     let mut client = HomeAssistant::new(&broker, port, &username, &password, cmd_tx)
       .map_err(|e| anyhow::anyhow!("MQTT init failed: {}", e))?;
@@ -367,92 +412,29 @@ fn run() -> anyhow::Result<()> {
     info!("Home Assistant MQTT ready");
     Some(client)
   } else {
+    boot_status!("Setup: http://{}/", _ip_addr);
     info!("MQTT not configured — visit http://{}/", _ip_addr);
     None
   };
 
   // ============================================================
-  // Boot info screen (feature: display)
+  // Finalize boot screen with MQTT status + config parameters
   // ============================================================
-  #[cfg(feature = "display")]
-  let mut info_until: Option<std::time::Instant> = {
-    use core::fmt::Write;
+  #[cfg(feature = "mqtt")]
+  if ha_client.is_some() {
+    boot_status!("MQTT: connected");
+  }
 
-    let text_style = MonoTextStyleBuilder::new()
-      .font(&FONT_10X20)
-      .text_color(BinaryColor::Off)
-      .build();
-
-    display.clear_framebuffer();
-
-    let mut y = 30i32;
-    let x = 10;
-    let line_height = 26i32;
-
-    let mut line_buf = [0u8; 40];
-
-    // Version
-    let mut w = LineBuf::new(&mut line_buf);
-    let _ = write!(w, "Water Controller v{}", env!("CARGO_PKG_VERSION"));
-    let len = w.pos;
-    Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
-      .draw(&mut display)?;
-    y += line_height;
-
-    // IP address
-    #[cfg(feature = "ethernet")]
-    {
-      let mut w = LineBuf::new(&mut line_buf);
-      let _ = write!(w, "IP: {}", _ip_addr);
-      let len = w.pos;
-      Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
-        .draw(&mut display)?;
-      y += line_height;
-    }
-
-    // MQTT status
-    #[cfg(feature = "mqtt")]
-    {
-      if mqtt_configured {
-        if ha_client.is_some() {
-          Text::new("MQTT: connected", Point::new(x, y), text_style)
-            .draw(&mut display)?;
-        }
-      } else {
-        let mut w = LineBuf::new(&mut line_buf);
-        let _ = write!(w, "Setup: http://{}/", _ip_addr);
-        let len = w.pos;
-        Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
-          .draw(&mut display)?;
-      }
-      y += line_height;
-    }
-
-    y += line_height / 2; // gap before parameters
-
-    // Config parameters
+  {
     let cfg = config.lock().unwrap();
-    for (label, value, unit) in [
-      ("Tank", cfg.tank_capacity_gallons, "gal"),
-      ("Height", cfg.sensor_height_feet, "ft"),
-      ("Max PSI", cfg.max_psi, ""),
-      ("Radar", cfg.radar_height_cm, "cm"),
-    ] {
-      let mut w = LineBuf::new(&mut line_buf);
-      if unit.is_empty() {
-        let _ = write!(w, "{}: {}", label, value);
-      } else {
-        let _ = write!(w, "{}: {} {}", label, value, unit);
-      }
-      let len = w.pos;
-      Text::new(unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) }, Point::new(x, y), text_style)
-        .draw(&mut display)?;
-      y += line_height;
-    }
+    boot_status!("Tank:{} gal  H:{} ft", cfg.tank_capacity_gallons, cfg.sensor_height_feet);
+    boot_status!("PSI:{}  Radar:{} cm", cfg.max_psi, cfg.radar_height_cm);
+  }
 
-    display.flush()?;
-    Some(std::time::Instant::now() + Duration::from_secs(2))
-  };
+  // Keep boot screen visible for 2 seconds before switching to normal display
+  #[cfg(feature = "display")]
+  let mut info_until: Option<std::time::Instant> =
+    Some(std::time::Instant::now() + Duration::from_secs(2));
 
   // ============================================================
   // Main loop
@@ -462,7 +444,7 @@ fn run() -> anyhow::Result<()> {
   // Demo values (will be replaced with real sensor data)
   #[cfg(any(feature = "display", feature = "mqtt"))]
   let mut demo_percent: u8 = 0;
-  #[cfg(all(feature = "display", not(feature = "pressure")))]
+  #[cfg(all(any(feature = "display", feature = "mqtt"), not(feature = "pressure")))]
   let mut demo_psi: u16 = 0;
   #[cfg(any(feature = "display", feature = "mqtt"))]
   let mut demo_rising = true;
@@ -594,8 +576,19 @@ fn run() -> anyhow::Result<()> {
       }
     };
     #[cfg(not(feature = "pressure"))]
-    #[cfg_attr(not(feature = "mqtt"), allow(unused_variables))]
-    let current_psi: u16 = 0;
+    let current_psi: u16 = {
+      #[cfg(any(feature = "display", feature = "mqtt"))]
+      {
+        if demo_rising {
+          demo_psi = demo_psi.saturating_add(8);
+        } else {
+          demo_psi = demo_psi.saturating_sub(8);
+        }
+        demo_psi.min(config.lock().unwrap().max_psi)
+      }
+      #[cfg(not(any(feature = "display", feature = "mqtt")))]
+      0
+    };
 
     // Demo animation for tank (will be replaced with radar data)
     #[cfg(any(feature = "display", feature = "mqtt"))]
@@ -661,22 +654,9 @@ fn run() -> anyhow::Result<()> {
       if !showing_info {
         let max_psi = config.lock().unwrap().max_psi;
 
-        // Get pressure value (real sensor or demo)
-        #[cfg(feature = "pressure")]
-        let psi = current_psi;
-        #[cfg(not(feature = "pressure"))]
-        let psi = {
-          if demo_rising {
-            demo_psi = demo_psi.saturating_add(8);
-          } else {
-            demo_psi = demo_psi.saturating_sub(8);
-          }
-          demo_psi.min(max_psi)
-        };
-
         // Update UI component values
         tank.set_level(demo_percent, gallons);
-        manometer.set_pressure(psi.min(max_psi));
+        manometer.set_pressure(current_psi.min(max_psi));
 
         // Draw UI (components clear their own areas)
         tank.draw(&mut display)?;

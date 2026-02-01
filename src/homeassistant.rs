@@ -261,7 +261,7 @@ impl HomeAssistant {
             "number",
             "tank_capacity",
             &format!(
-                r#"{{"name":"Tank Capacity","uniq_id":"wc_tank_cap","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.tank_capacity }}}}","cmd_t":"watercontroller/set/tank_capacity","min":100,"max":2000,"step":10,"unit_of_meas":"gal","ic":"mdi:storage-tank",{}}}"#,
+                r#"{{"name":"Tank Capacity","uniq_id":"wc_tank_cap","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.tank_capacity }}}}","cmd_t":"watercontroller/set/tank_capacity","min":100,"max":2000,"step":10,"mode":"box","unit_of_meas":"gal","ic":"mdi:storage-tank",{}}}"#,
                 device_info
             ),
         )?;
@@ -271,7 +271,7 @@ impl HomeAssistant {
             "number",
             "sensor_height",
             &format!(
-                r#"{{"name":"Sensor Height","uniq_id":"wc_height","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.sensor_height }}}}","cmd_t":"watercontroller/set/sensor_height","min":0,"max":50,"step":1,"unit_of_meas":"ft","ic":"mdi:arrow-expand-vertical",{}}}"#,
+                r#"{{"name":"Sensor Height","uniq_id":"wc_height","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.sensor_height }}}}","cmd_t":"watercontroller/set/sensor_height","min":0,"max":50,"step":1,"mode":"box","unit_of_meas":"ft","ic":"mdi:arrow-expand-vertical",{}}}"#,
                 device_info
             ),
         )?;
@@ -281,7 +281,7 @@ impl HomeAssistant {
             "number",
             "max_psi",
             &format!(
-                r#"{{"name":"Manometer Range","uniq_id":"wc_max_psi","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.max_psi }}}}","cmd_t":"watercontroller/set/max_psi","min":50,"max":300,"step":10,"unit_of_meas":"psi","ic":"mdi:gauge",{}}}"#,
+                r#"{{"name":"Manometer Range","uniq_id":"wc_max_psi","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.max_psi }}}}","cmd_t":"watercontroller/set/max_psi","min":50,"max":300,"step":10,"mode":"box","unit_of_meas":"psi","ic":"mdi:gauge",{}}}"#,
                 device_info
             ),
         )?;
@@ -291,7 +291,7 @@ impl HomeAssistant {
             "number",
             "radar_height",
             &format!(
-                r#"{{"name":"Radar Height","uniq_id":"wc_radar_ht","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.radar_height }}}}","cmd_t":"watercontroller/set/radar_height","min":10,"max":500,"step":1,"unit_of_meas":"cm","ic":"mdi:signal-distance-variant",{}}}"#,
+                r#"{{"name":"Radar Height","uniq_id":"wc_radar_ht","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.radar_height }}}}","cmd_t":"watercontroller/set/radar_height","min":10,"max":500,"step":1,"mode":"box","unit_of_meas":"cm","ic":"mdi:signal-distance-variant",{}}}"#,
                 device_info
             ),
         )?;
