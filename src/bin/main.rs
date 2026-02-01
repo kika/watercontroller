@@ -324,10 +324,8 @@ fn run() -> anyhow::Result<()> {
       &uart_config,
     )?;
 
-    let mut radar = Sen0676::new(uart, DEFAULT_ADDRESS);
-    info!("Radar sensor initialized, draining boot messages...");
-    radar.drain_ascii_messages();
-    info!("Radar ready");
+    let radar = Sen0676::new(uart, DEFAULT_ADDRESS);
+    info!("Radar sensor initialized");
 
     radar
   };
