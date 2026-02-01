@@ -271,7 +271,7 @@ impl HomeAssistant {
             "number",
             "sensor_height",
             &format!(
-                r#"{{"name":"Sensor Height","uniq_id":"wc_height","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.sensor_height }}}}","cmd_t":"watercontroller/set/sensor_height","min":0,"max":50,"step":1,"mode":"box","unit_of_meas":"ft","ic":"mdi:arrow-expand-vertical",{}}}"#,
+                r#"{{"name":"Pressure sensor Height","uniq_id":"wc_height","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.sensor_height }}}}","cmd_t":"watercontroller/set/sensor_height","min":0,"max":50,"step":1,"mode":"box","unit_of_meas":"ft","ic":"mdi:arrow-expand-vertical",{}}}"#,
                 device_info
             ),
         )?;
