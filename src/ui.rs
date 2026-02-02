@@ -87,10 +87,10 @@ impl WaterTank {
 
         // Format text
         let mut percent_buf = [0u8; 8];
-        let percent_str = format_percent(self.fill_percent, &mut percent_buf);
+        let percent_str = format_with_suffix(self.fill_percent as u16, &mut percent_buf, b"%");
 
         let mut gallons_buf = [0u8; 12];
-        let gallons_str = format_gallons(self.gallons, &mut gallons_buf);
+        let gallons_str = format_with_suffix(self.gallons, &mut gallons_buf, b" gal");
 
         let text_style = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
@@ -177,55 +177,18 @@ impl Manometer {
         let end_angle: f32 = -45.0;
         let sweep = start_angle - end_angle; // 270 degrees
 
-        // Major ticks every 30 PSI (6 ticks: 0, 30, 60, 90, 120, 150)
-        for i in 0..=5 {
-            let psi = i * 30;
-            let angle_deg = start_angle - (psi as f32 / self.max_psi as f32) * sweep;
-            let angle_rad = angle_deg * core::f32::consts::PI / 180.0;
-
-            let cos_a = libm::cosf(angle_rad);
-            let sin_a = libm::sinf(angle_rad);
-
-            // Tick mark from 85% to 95% of radius
-            let inner_r = (self.radius as f32 * 0.80) as i32;
-            let outer_r = (self.radius as f32 * 0.95) as i32;
-
-            let x1 = self.center.x + (cos_a * inner_r as f32) as i32;
-            let y1 = self.center.y - (sin_a * inner_r as f32) as i32;
-            let x2 = self.center.x + (cos_a * outer_r as f32) as i32;
-            let y2 = self.center.y - (sin_a * outer_r as f32) as i32;
-
-            Line::new(Point::new(x1, y1), Point::new(x2, y2))
-                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::Off, 2))
-                .draw(display)?;
-
-            // Draw label
-            let label_r = (self.radius as f32 * 0.65) as i32;
-            let label_x = self.center.x + (cos_a * label_r as f32) as i32;
-            let label_y = self.center.y - (sin_a * label_r as f32) as i32;
-
-            let mut label_buf = [0u8; 4];
-            let label_str = format_number(psi as u16, &mut label_buf);
-
-            let label_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::Off);
-            let text_style = TextStyleBuilder::new().alignment(Alignment::Center).build();
-            Text::with_text_style(label_str, Point::new(label_x, label_y + 3), label_style, text_style)
-                .draw(display)?;
-        }
-
-        // Minor ticks every 10 PSI
+        // Draw all ticks: major every 30 PSI, minor every 10 PSI
         for i in 0..=15 {
             let psi = i * 10;
-            if psi % 30 == 0 {
-                continue; // Skip major tick positions
-            }
+            let is_major = psi % 30 == 0;
             let angle_deg = start_angle - (psi as f32 / self.max_psi as f32) * sweep;
             let angle_rad = angle_deg * core::f32::consts::PI / 180.0;
 
             let cos_a = libm::cosf(angle_rad);
             let sin_a = libm::sinf(angle_rad);
 
-            let inner_r = (self.radius as f32 * 0.88) as i32;
+            let inner_frac = if is_major { 0.80 } else { 0.88 };
+            let inner_r = (self.radius as f32 * inner_frac) as i32;
             let outer_r = (self.radius as f32 * 0.95) as i32;
 
             let x1 = self.center.x + (cos_a * inner_r as f32) as i32;
@@ -233,9 +196,24 @@ impl Manometer {
             let x2 = self.center.x + (cos_a * outer_r as f32) as i32;
             let y2 = self.center.y - (sin_a * outer_r as f32) as i32;
 
+            let stroke_w = if is_major { 2 } else { 1 };
             Line::new(Point::new(x1, y1), Point::new(x2, y2))
-                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::Off, 1))
+                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::Off, stroke_w))
                 .draw(display)?;
+
+            if is_major {
+                let label_r = (self.radius as f32 * 0.65) as i32;
+                let label_x = self.center.x + (cos_a * label_r as f32) as i32;
+                let label_y = self.center.y - (sin_a * label_r as f32) as i32;
+
+                let mut label_buf = [0u8; 4];
+                let label_str = format_number(psi as u16, &mut label_buf);
+
+                let label_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::Off);
+                let text_style = TextStyleBuilder::new().alignment(Alignment::Center).build();
+                Text::with_text_style(label_str, Point::new(label_x, label_y + 3), label_style, text_style)
+                    .draw(display)?;
+            }
         }
 
         // Draw needle
@@ -264,7 +242,7 @@ impl Manometer {
 
         // Digital readout below center
         let mut psi_buf = [0u8; 8];
-        let psi_str = format_psi(self.pressure_psi, &mut psi_buf);
+        let psi_str = format_with_suffix(self.pressure_psi, &mut psi_buf, b" PSI");
 
         let psi_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
         let text_style = TextStyleBuilder::new().alignment(Alignment::Center).build();
@@ -298,23 +276,8 @@ fn format_number(n: u16, buf: &mut [u8]) -> &str {
     unsafe { core::str::from_utf8_unchecked(&buf[..i]) }
 }
 
-fn format_percent(n: u8, buf: &mut [u8]) -> &str {
-    let mut i = format_number(n as u16, buf).len();
-    buf[i] = b'%';
-    i += 1;
-    unsafe { core::str::from_utf8_unchecked(&buf[..i]) }
-}
-
-fn format_gallons(n: u16, buf: &mut [u8]) -> &str {
-    let mut i = format_number(n, buf).len();
-    buf[i..i + 4].copy_from_slice(b" gal");
-    i += 4;
-    unsafe { core::str::from_utf8_unchecked(&buf[..i]) }
-}
-
-fn format_psi(n: u16, buf: &mut [u8]) -> &str {
-    let mut i = format_number(n, buf).len();
-    buf[i..i + 4].copy_from_slice(b" PSI");
-    i += 4;
-    unsafe { core::str::from_utf8_unchecked(&buf[..i]) }
+fn format_with_suffix<'a>(n: u16, buf: &'a mut [u8], suffix: &[u8]) -> &'a str {
+    let i = format_number(n, buf).len();
+    buf[i..i + suffix.len()].copy_from_slice(suffix);
+    unsafe { core::str::from_utf8_unchecked(&buf[..i + suffix.len()]) }
 }

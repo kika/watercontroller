@@ -174,13 +174,12 @@ fn run() -> anyhow::Result<()> {
         let mut buf = [0u8; 40];
         let mut w = LineBuf::new(&mut buf);
         let _ = write!(w, $($arg)*);
-        let len = w.pos;
         if boot_line == 0 {
           display.clear_framebuffer();
         }
         let y = 26 + boot_line * 26;
         Text::new(
-          unsafe { core::str::from_utf8_unchecked(&buf[..len]) },
+          w.as_str(),
           Point::new(10, y as i32),
           boot_text_style,
         ).draw(&mut display).ok();
@@ -444,7 +443,9 @@ fn run() -> anyhow::Result<()> {
   // ============================================================
   info!("Entering main loop...");
 
+  // Read by MQTT publish gate and display overlay on link loss
   #[cfg(feature = "ethernet")]
+  #[allow(unused_assignments, unused_variables)]
   let mut network_up = true;
 
   // Demo values (only when no real sensors are enabled)
@@ -469,7 +470,9 @@ fn run() -> anyhow::Result<()> {
 
   loop {
     // Check for network events (non-blocking)
+    // network_up is read when mqtt feature is enabled
     #[cfg(feature = "ethernet")]
+    #[allow(unused_assignments)]
     while let Ok(event) = rx.try_recv() {
       match event {
         NetEvent::LinkDown => {
@@ -519,42 +522,28 @@ fn run() -> anyhow::Result<()> {
       while let Ok(cmd) = cmd_rx.try_recv() {
         let msg: Option<&str> = {
           let mut cfg = config.lock().unwrap();
+          macro_rules! apply_cfg {
+            ($method:ident, $val:expr, $label:expr) => {{
+              if let Err(e) = cfg.$method($val) {
+                warn!("Failed to set {}: {:?}", $label, e);
+              }
+              Some($label)
+            }};
+          }
           match cmd {
-            ConfigCommand::SetTankCapacity(val) => {
-              if let Err(e) = cfg.set_tank_capacity(val) {
-                warn!("Failed to set tank capacity: {:?}", e);
-              }
-              Some("Tank Capacity")
-            }
-            ConfigCommand::SetSensorHeight(val) => {
-              if let Err(e) = cfg.set_sensor_height(val) {
-                warn!("Failed to set sensor height: {:?}", e);
-              }
-              Some("Sensor Height")
-            }
-            ConfigCommand::SetMaxPsi(val) => {
-              if let Err(e) = cfg.set_max_psi(val) {
-                warn!("Failed to set max PSI: {:?}", e);
-              }
-              Some("Max PSI")
-            }
+            ConfigCommand::SetTankCapacity(val) => apply_cfg!(set_tank_capacity, val, "Tank Capacity"),
+            ConfigCommand::SetSensorHeight(val) => apply_cfg!(set_sensor_height, val, "Sensor Height"),
+            ConfigCommand::SetMaxPsi(val) => apply_cfg!(set_max_psi, val, "Max PSI"),
             ConfigCommand::SetRadarHeight(val) => {
-              if let Err(e) = cfg.set_radar_height(val) {
-                warn!("Failed to set radar height: {:?}", e);
-              }
+              let label = apply_cfg!(set_radar_height, val, "Radar Height");
               #[cfg(feature = "radar")]
               match radar.configure_height(val) {
                 Ok(range) => info!("Radar: height {} cm, range {} m", val, range),
                 Err(e) => warn!("Failed to configure radar height: {:?}", e),
               }
-              Some("Radar Height")
+              label
             }
-            ConfigCommand::SetRadarDeadzone(val) => {
-              if let Err(e) = cfg.set_radar_deadzone(val) {
-                warn!("Failed to set radar deadzone: {:?}", e);
-              }
-              Some("Radar Deadzone")
-            }
+            ConfigCommand::SetRadarDeadzone(val) => apply_cfg!(set_radar_deadzone, val, "Radar Deadzone"),
           }
         };
 
@@ -588,9 +577,8 @@ fn run() -> anyhow::Result<()> {
           };
           let mut w = LineBuf::new(&mut line_buf);
           let _ = write!(w, "{}: {}{}", label, value, unit);
-          let len = w.pos;
           Text::new(
-            unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) },
+            w.as_str(),
             Point::new(10, 120),
             text_style,
           ).draw(&mut display)?;
@@ -648,8 +636,9 @@ fn run() -> anyhow::Result<()> {
         };
       }
 
-      // No pressure sensor — PSI stays at 0
+      // No pressure sensor — PSI stays at 0 (may be overwritten by demo mode below)
       #[cfg(not(feature = "pressure"))]
+      #[allow(unused_assignments)]
       { current_psi = 0; }
 
       // Demo mode (no real sensors)
@@ -751,13 +740,13 @@ fn run() -> anyhow::Result<()> {
     let mut line_buf = [0u8; 60];
     let mut w = LineBuf::new(&mut line_buf);
     let _ = write!(w, "{:#}", e);
-    let len = w.pos;
-    let msg = unsafe { core::str::from_utf8_unchecked(&line_buf[..len]) };
+    let msg = w.as_str();
 
     // Split long messages across lines
     let mut y = 70i32;
     let chars_per_line = 38; // 400px / 10px per char ≈ 38
     for chunk in msg.as_bytes().chunks(chars_per_line) {
+      // Safe: splitting valid UTF-8 at ASCII boundaries (all our content is ASCII)
       let s = unsafe { core::str::from_utf8_unchecked(chunk) };
       Text::new(s, Point::new(10, y), text_style)
         .draw(&mut display).ok();
@@ -786,6 +775,12 @@ struct LineBuf<'a> {
 impl<'a> LineBuf<'a> {
   fn new(buf: &'a mut [u8]) -> Self {
     Self { buf, pos: 0 }
+  }
+
+  /// View written bytes as a str.
+  /// Safety: only valid UTF-8 is written via core::fmt::Write.
+  fn as_str(&self) -> &str {
+    unsafe { core::str::from_utf8_unchecked(&self.buf[..self.pos]) }
   }
 }
 

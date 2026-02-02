@@ -205,11 +205,16 @@ impl HomeAssistant {
     /// Subscribe to command topics
     pub fn subscribe(&mut self) -> Result<(), esp_idf_svc::sys::EspError> {
         info!("Subscribing to command topics...");
-        self.client.subscribe(CMD_TOPIC_TANK_CAPACITY, QoS::AtLeastOnce)?;
-        self.client.subscribe(CMD_TOPIC_SENSOR_HEIGHT, QoS::AtLeastOnce)?;
-        self.client.subscribe(CMD_TOPIC_MAX_PSI, QoS::AtLeastOnce)?;
-        self.client.subscribe(CMD_TOPIC_RADAR_HEIGHT, QoS::AtLeastOnce)?;
-        self.client.subscribe(CMD_TOPIC_RADAR_DEADZONE, QoS::AtLeastOnce)?;
+        const CMD_TOPICS: &[&str] = &[
+            CMD_TOPIC_TANK_CAPACITY,
+            CMD_TOPIC_SENSOR_HEIGHT,
+            CMD_TOPIC_MAX_PSI,
+            CMD_TOPIC_RADAR_HEIGHT,
+            CMD_TOPIC_RADAR_DEADZONE,
+        ];
+        for topic in CMD_TOPICS {
+            self.client.subscribe(topic, QoS::AtLeastOnce)?;
+        }
         info!("Subscribed to command topics");
         Ok(())
     }
@@ -228,89 +233,43 @@ impl HomeAssistant {
         // Common device info (shared by all entities)
         let device_info = r#""dev":{"ids":"watercontroller","name":"Water Controller","mf":"DIY","mdl":"wESP32"}"#;
 
-        // --- Sensor entities ---
+        // Sensor entities (read-only)
+        const SENSORS: &[(&str, &str, &str, &str, &str, &str)] = &[
+            // (discovery_name, ha_name, unique_id, value_key, unit, extra)
+            ("capacity_percent", "Water Capacity", "wc_capacity_pct", "capacity_pct", "%", r#""dev_cla":"battery","stat_cla":"measurement""#),
+            ("capacity_gallons", "Water Volume", "wc_capacity_gal", "gallons", "gal", r#""ic":"mdi:water","stat_cla":"measurement""#),
+            ("pressure", "Water Pressure", "wc_pressure", "pressure_psi", "psi", r#""dev_cla":"pressure","stat_cla":"measurement""#),
+        ];
 
-        // Capacity percent sensor
-        self.publish_discovery(
-            "sensor",
-            "capacity_percent",
-            &format!(
-                r#"{{"name":"Water Capacity","uniq_id":"wc_capacity_pct","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.capacity_pct }}}}","unit_of_meas":"%","dev_cla":"battery","stat_cla":"measurement",{}}}"#,
-                device_info
-            ),
-        )?;
+        for &(disc_name, name, uid, val_key, unit, extra) in SENSORS {
+            self.publish_discovery(
+                "sensor",
+                disc_name,
+                &format!(
+                    r#"{{"name":"{name}","uniq_id":"{uid}","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.{val_key} }}}}","unit_of_meas":"{unit}",{extra},{device_info}}}"#,
+                ),
+            )?;
+        }
 
-        // Capacity gallons sensor
-        self.publish_discovery(
-            "sensor",
-            "capacity_gallons",
-            &format!(
-                r#"{{"name":"Water Volume","uniq_id":"wc_capacity_gal","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.gallons }}}}","unit_of_meas":"gal","ic":"mdi:water","stat_cla":"measurement",{}}}"#,
-                device_info
-            ),
-        )?;
+        // Number entities (configurable parameters)
+        const NUMBERS: &[(&str, &str, &str, &str, &str, u16, u16, u16, &str, &str)] = &[
+            // (disc_name, ha_name, unique_id, value_key, cmd_topic_suffix, min, max, step, unit, icon)
+            ("tank_capacity", "Tank Capacity", "wc_tank_cap", "tank_capacity", "tank_capacity", 100, 2000, 10, "gal", "mdi:storage-tank"),
+            ("sensor_height", "Pressure sensor Height", "wc_height", "sensor_height", "sensor_height", 0, 50, 1, "ft", "mdi:arrow-expand-vertical"),
+            ("max_psi", "Manometer Range", "wc_max_psi", "max_psi", "max_psi", 50, 300, 10, "psi", "mdi:gauge"),
+            ("radar_height", "Radar Height", "wc_radar_ht", "radar_height", "radar_height", 10, 500, 1, "cm", "mdi:signal-distance-variant"),
+            ("radar_deadzone", "Radar Deadzone", "wc_radar_dz", "radar_deadzone", "radar_deadzone", 0, 200, 1, "cm", "mdi:arrow-collapse-down"),
+        ];
 
-        // Pressure sensor
-        self.publish_discovery(
-            "sensor",
-            "pressure",
-            &format!(
-                r#"{{"name":"Water Pressure","uniq_id":"wc_pressure","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.pressure_psi }}}}","unit_of_meas":"psi","dev_cla":"pressure","stat_cla":"measurement",{}}}"#,
-                device_info
-            ),
-        )?;
-
-        // --- Number entities (configurable parameters) ---
-
-        // Tank capacity
-        self.publish_discovery(
-            "number",
-            "tank_capacity",
-            &format!(
-                r#"{{"name":"Tank Capacity","uniq_id":"wc_tank_cap","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.tank_capacity }}}}","cmd_t":"watercontroller/set/tank_capacity","min":100,"max":2000,"step":10,"mode":"box","unit_of_meas":"gal","ic":"mdi:storage-tank",{}}}"#,
-                device_info
-            ),
-        )?;
-
-        // Sensor height
-        self.publish_discovery(
-            "number",
-            "sensor_height",
-            &format!(
-                r#"{{"name":"Pressure sensor Height","uniq_id":"wc_height","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.sensor_height }}}}","cmd_t":"watercontroller/set/sensor_height","min":0,"max":50,"step":1,"mode":"box","unit_of_meas":"ft","ic":"mdi:arrow-expand-vertical",{}}}"#,
-                device_info
-            ),
-        )?;
-
-        // Max PSI
-        self.publish_discovery(
-            "number",
-            "max_psi",
-            &format!(
-                r#"{{"name":"Manometer Range","uniq_id":"wc_max_psi","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.max_psi }}}}","cmd_t":"watercontroller/set/max_psi","min":50,"max":300,"step":10,"mode":"box","unit_of_meas":"psi","ic":"mdi:gauge",{}}}"#,
-                device_info
-            ),
-        )?;
-
-        // Radar installation height
-        self.publish_discovery(
-            "number",
-            "radar_height",
-            &format!(
-                r#"{{"name":"Radar Height","uniq_id":"wc_radar_ht","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.radar_height }}}}","cmd_t":"watercontroller/set/radar_height","min":10,"max":500,"step":1,"mode":"box","unit_of_meas":"cm","ic":"mdi:signal-distance-variant",{}}}"#,
-                device_info
-            ),
-        )?;
-
-        // Radar deadzone (distance from sensor to max water level)
-        self.publish_discovery(
-            "number",
-            "radar_deadzone",
-            &format!(
-                r#"{{"name":"Radar Deadzone","uniq_id":"wc_radar_dz","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.radar_deadzone }}}}","cmd_t":"watercontroller/set/radar_deadzone","min":0,"max":200,"step":1,"mode":"box","unit_of_meas":"cm","ic":"mdi:arrow-collapse-down",{}}}"#,
-                device_info
-            ),
-        )?;
+        for &(disc_name, name, uid, val_key, cmd_suffix, min, max, step, unit, icon) in NUMBERS {
+            self.publish_discovery(
+                "number",
+                disc_name,
+                &format!(
+                    r#"{{"name":"{name}","uniq_id":"{uid}","stat_t":"watercontroller/state","val_tpl":"{{{{ value_json.{val_key} }}}}","cmd_t":"watercontroller/set/{cmd_suffix}","min":{min},"max":{max},"step":{step},"mode":"box","unit_of_meas":"{unit}","ic":"{icon}",{device_info}}}"#,
+                ),
+            )?;
+        }
 
         self.discovery_sent = true;
         info!("Discovery messages sent");
